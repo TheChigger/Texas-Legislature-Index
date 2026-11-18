@@ -1,4 +1,5 @@
 import {
+  backfillPoliticiansFromBills,
   db,
   evaluateAlertRules,
   recomputeBillMetrics,
@@ -13,6 +14,8 @@ export function seedDatabaseIfEmpty(): void {
   if (existing.c > 0) {
     seedPublicSentimentIfEmpty();
     seedStatutesIfEmpty();
+    seedBillDocumentsIfEmpty();
+    backfillPoliticiansFromBills();
     return;
   }
 
@@ -1358,6 +1361,8 @@ export function seedDatabaseIfEmpty(): void {
   evaluateAlertRules();
   seedPublicSentimentIfEmpty();
   seedStatutesIfEmpty();
+  seedBillDocumentsIfEmpty();
+  backfillPoliticiansFromBills();
 }
 
 export function seedPublicSentimentIfEmpty(): void {
@@ -1652,5 +1657,133 @@ export function seedStatutesIfEmpty(): void {
     insertSnap.run(`${sid}-${sdate}`, sid, code, secNum, sdate, header, txt, acts);
   }
 }
+
+export function seedBillDocumentsIfEmpty(): void {
+  const existing = db.prepare(`SELECT COUNT(*) AS c FROM bill_documents`).get() as { c: number };
+  if (existing.c > 0) return;
+
+  const docs: Array<{
+    id: string;
+    billId: string;
+    docType: 'analysis' | 'fiscal_note';
+    versionCode: string;
+    versionLabel: string;
+    title: string;
+    summary: string;
+    fullText: string;
+    source: string;
+  }> = [
+    {
+      id: '89R-HB2-doc-analysis-H',
+      billId: '89R-HB2',
+      docType: 'analysis',
+      versionCode: 'H',
+      versionLabel: 'House Committee Report',
+      title: 'HB 2 House Research Organization / Committee Bill Analysis (CSHB 2)',
+      summary:
+        'Committee substitute increases the basic allotment from $6,160 to $6,555, creates the Teacher Retention Allotment ($2,500–$8,000), and transitions special education funding to intensity-of-service tiers.',
+      fullText: `BACKGROUND AND PURPOSE\nCSHB 2 consolidates House Public Education school finance proposals into a single $8.5 billion biennial package.\nKEY REVISIONS IN CSHB 2\n- Raises the Sec. 48.051 basic allotment to $6,555 per ADA (up from $6,380 as introduced).\n- Adds Sec. 48.158 Teacher Retention Allotment providing tiered salary raises for teachers with 3+ years of tenure, with higher rural weightings.\n- Shifts Special Education funding toward intensity-of-service tiers and boosts campus school safety allotments to $28,000 per campus.`,
+      source: 'TLO HRO / Committee Bill Analysis (89R)',
+    },
+    {
+      id: '89R-HB2-doc-fiscal-H',
+      billId: '89R-HB2',
+      docType: 'fiscal_note',
+      versionCode: 'H',
+      versionLabel: 'House Committee Report',
+      title: 'HB 2 Legislative Budget Board Fiscal Note (CSHB 2)',
+      summary:
+        'LBB estimates an $8.50 billion General Revenue and Foundation School Fund biennial cost for FY 2026–2027, contingent upon SB 1 Article III appropriations.',
+      fullText: `FISCAL IMPACT SUMMARY (LBB)\nProbable Net General Revenue-Related Impact: -$8,500,000,000 for the 2026–2027 biennium.\nIncludes $3.9B for the basic allotment increase, $2.8B for Teacher Retention and Incentive Allotments, $850M for Special Education intensity-of-service transition, and $430M for campus safety allotments.`,
+      source: 'TLO LBB Fiscal Note (89R)',
+    },
+    {
+      id: '89R-SB2-doc-analysis-H',
+      billId: '89R-SB2',
+      docType: 'analysis',
+      versionCode: 'H',
+      versionLabel: 'House Committee Report',
+      title: 'SB 2 House Committee Bill Analysis (CSSB 2)',
+      summary:
+        'House committee substitute replaces uncapped universal eligibility with a $1.0B biennial appropriation cap and prioritizes 80% of slots for households under 500% FPL and students with disabilities.',
+      fullText: `BACKGROUND AND PURPOSE\nCSSB 2 establishes Texas Education Freedom Accounts under Subchapter J, Chapter 29, Education Code.\nCOMMITTEE SUBSTITUTIONS\n- Caps biennial expenditures at $1,000,000,000 rather than open-ended entitlement.\n- Sets private tuition allotment at 85% of statewide per-pupil public funding (~$10,000) and $2,000 for verified homeschool instructional materials.\n- Mandates annual norm-referenced assessments and Comptroller financial audits.`,
+      source: 'TLO Committee Bill Analysis (89R)',
+    },
+    {
+      id: '89R-SB2-doc-fiscal-H',
+      billId: '89R-SB2',
+      docType: 'fiscal_note',
+      versionCode: 'H',
+      versionLabel: 'House Committee Report',
+      title: 'SB 2 Legislative Budget Board Fiscal Note (CSSB 2)',
+      summary:
+        'LBB estimates $1.00 billion General Revenue cost in FY 2026–2027 for Education Freedom Accounts plus Comptroller administrative staffing of 42.0 FTEs.',
+      fullText: `FISCAL IMPACT SUMMARY (LBB)\nBiennial Cost: $1,000,000,000 General Revenue cap for FY 2026–2027 (rising to $2.4B/year in out-years if cap is raised by future legislatures). Comptroller program administration and vendor auditing platform estimated at $18.4M.`,
+      source: 'TLO LBB Fiscal Note (89R)',
+    },
+    {
+      id: '89R-SB1-doc-fiscal-F',
+      billId: '89R-SB1',
+      docType: 'fiscal_note',
+      versionCode: 'F',
+      versionLabel: 'Enrolled',
+      title: 'SB 1 General Appropriations Conference Summary (LBB)',
+      summary:
+        'Certifies $338.0B all-funds biennial budget locking $51B property tax relief, $8.5B for HB 2 school finance, $1.0B for SB 2 vouchers, and $2.5B for the Texas Water Fund.',
+      fullText: `LBB CONFERENCE BUDGET SUMMARY\nAll Funds 2026–2027: $338.0 billion. General Revenue: $154.2 billion.\nRider Contingencies: Appropriates $8.5B contingent upon HB 2 enactment, $1.0B contingent upon SB 2, and $90M for HB 3000 rural emergency ambulance grants.`,
+      source: 'TLO LBB Fiscal Note (89R)',
+    },
+    {
+      id: '89R-HB14-doc-analysis-E',
+      billId: '89R-HB14',
+      docType: 'analysis',
+      versionCode: 'E',
+      versionLabel: 'Engrossed',
+      title: 'HB 14 House Bill Analysis (Engrossed)',
+      summary:
+        'Establishes the Texas Advanced Nuclear Energy Office and expands matching grant authorization from $200M to $350M for NRC licensing and ERCOT firm baseload interconnection.',
+      fullText: `DIGEST\nHB 14 creates Chapter 483, Government Code, establishing the Texas Advanced Nuclear Energy Office and a $350M matching reimbursement grant fund to accelerate small modular reactor siting and ERCOT interconnection.`,
+      source: 'TLO Committee Bill Analysis (89R)',
+    },
+    {
+      id: '89R-SB14-doc-analysis-F',
+      billId: '89R-SB14',
+      docType: 'analysis',
+      versionCode: 'F',
+      versionLabel: 'Enrolled',
+      title: 'SB 14 Senate Research Center Bill Analysis (Enrolled)',
+      summary:
+        'Replaces mandatory 5-year rule expiration from the filed draft with targeted cost-benefit audits for agency rules exceeding $1M in statewide compliance impact.',
+      fullText: `AUTHOR'S / SPONSOR'S STATEMENT OF INTENT\nSB 14 creates the Texas Regulatory Efficiency Office to coordinate agency cost-benefit reviews for proposed Texas Administrative Code rules exceeding $1,000,000 in statewide compliance costs.`,
+      source: 'TLO SRC Bill Analysis (89R)',
+    },
+    {
+      id: '89R-HB4-doc-analysis-E',
+      billId: '89R-HB4',
+      docType: 'analysis',
+      versionCode: 'E',
+      versionLabel: 'Engrossed',
+      title: 'HB 4 Bill Analysis (Engrossed — Stalled in Conference)',
+      summary:
+        'Replaced single-day STAAR exams with three shorter through-year adaptive checkpoints; stalled late in May 2025 over Senate A-F accountability parity demands.',
+      fullText: `DIGEST\nHB 4 amends Chapter 39, Education Code, replacing STAAR summative exams with fall, winter, and spring adaptive instructional checkpoints and limiting test-prep days to 5% of the instructional calendar.`,
+      source: 'TLO Committee Bill Analysis (89R)',
+    },
+  ];
+
+  const insertDoc = db.prepare(`
+    INSERT OR IGNORE INTO bill_documents
+    (id, bill_id, doc_type, version_code, version_label, title, summary, full_text, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const checkBill = db.prepare(`SELECT id FROM bills WHERE id = ?`);
+
+  for (const d of docs) {
+    if (checkBill.get(d.billId)) {
+      insertDoc.run(d.id, d.billId, d.docType, d.versionCode, d.versionLabel, d.title, d.summary, d.fullText, d.source);
+    }
+  }
+}
+
 
 

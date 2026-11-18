@@ -4,6 +4,7 @@ import {
   buildSafeFtsQuery,
   db,
   evaluateAlertRules,
+  normalizeIsoDate,
   recomputeBillMetrics,
   refreshSessionCounts,
   syncAmendmentFts,
@@ -17,10 +18,13 @@ import {
   listTloFtpSessions,
   startTloSyncJob,
   syncFromTloFtp,
+  syncLegislatorsFromTloFtp,
   type TloBillType,
 } from './tloFtp.ts';
 import { fetchStatuteSnapshotByDate, syncTexasCodeFromTloFtp } from './statutes.ts';
 import type {
+  BillDocument,
+  BillStage,
   BillSummary,
   Chamber,
   KeywordOverlapMatch,
@@ -28,6 +32,10 @@ import type {
   NetworkEdge,
   NetworkGraph,
   NetworkNode,
+  TimelineCohort,
+  TimelineCohortBill,
+  TimelineConsolidation,
+  TimelineEventItem,
 } from '../types.ts';
 
 export const apiRouter = Router();
@@ -487,6 +495,16 @@ apiRouter.get('/bills/:id', (req, res) => {
       .reduce((s, c) => s + c.volumeCount, 0),
   };
 
+  const documents = db
+    .prepare(
+      `SELECT id, bill_id AS billId, doc_type AS docType, version_code AS versionCode,
+              version_label AS versionLabel, title, summary, full_text AS fullText, source
+       FROM bill_documents
+       WHERE bill_id = ?
+       ORDER BY CASE doc_type WHEN 'analysis' THEN 1 ELSE 2 END, version_code ASC`
+    )
+    .all(row.id) as BillDocument[];
+
   res.json({
     ...bill,
     fullText: row.full_text,
@@ -501,6 +519,7 @@ apiRouter.get('/bills/:id', (req, res) => {
     })),
     constituentLogs,
     publicSentiment,
+    documents,
   });
 });
 
@@ -786,8 +805,10 @@ apiRouter.get('/politicians', (req, res) => {
     params.push(party);
   }
   if (q) {
-    where.push('(LOWER(p.name) LIKE ? OR LOWER(p.district) LIKE ? OR LOWER(p.leadership_role) LIKE ?)');
-    params.push(`%${q}%`, `%${q}%`, `%${q}%`);
+    where.push(
+      '(LOWER(p.name) LIKE ? OR LOWER(p.short_name) LIKE ? OR LOWER(p.district) LIKE ? OR LOWER(p.leadership_role) LIKE ?)'
+    );
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
 
   const rows = db
@@ -799,10 +820,30 @@ apiRouter.get('/politicians', (req, res) => {
               (SELECT COUNT(*) FROM votes v WHERE v.politician_id = p.id) AS votesCount
        FROM politicians p
        ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-       ORDER BY p.total_raised DESC`
+       ORDER BY p.total_raised DESC, p.bills_authored DESC, p.name ASC`
     )
     .all(...params);
   res.json({ politicians: rows });
+});
+
+apiRouter.post('/politicians/sync-tlo', async (req, res) => {
+  try {
+    const body = req.body as {
+      session?: string;
+      fetchProfiles?: boolean;
+      concurrency?: number;
+    };
+    const session = (body.session || '89R').trim();
+    const fetchProfiles = body.fetchProfiles !== false;
+    const concurrency = Math.min(Math.max(Number(body.concurrency) || 4, 1), 6);
+
+    const result = await syncLegislatorsFromTloFtp(session, { fetchProfiles, concurrency });
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({
+      error: err instanceof Error ? err.message : 'Failed to sync legislator roster from TLO FTP',
+    });
+  }
 });
 
 apiRouter.get('/politicians/:id', (req, res) => {
@@ -1755,6 +1796,7 @@ apiRouter.post('/tlo/sync', async (req, res) => {
     startNumber,
     includeBillText,
     includeWitnesses,
+    includeDocuments,
     skipUnchanged,
     concurrency,
   } = req.body ?? {};
@@ -1769,6 +1811,7 @@ apiRouter.post('/tlo/sync', async (req, res) => {
       startNumber: startNumber ? Number(startNumber) : 1,
       includeBillText: includeBillText !== false,
       includeWitnesses: includeWitnesses !== undefined ? Boolean(includeWitnesses) : undefined,
+      includeDocuments: includeDocuments !== undefined ? Boolean(includeDocuments) : undefined,
       skipUnchanged: Boolean(skipUnchanged),
       concurrency: concurrency ? Number(concurrency) : 4,
     });
@@ -1789,6 +1832,7 @@ apiRouter.post('/tlo/sync-session', (req, res) => {
     startNumber,
     includeBillText,
     includeWitnesses,
+    includeDocuments,
     skipUnchanged,
     concurrency,
   } = req.body ?? {};
@@ -1804,6 +1848,7 @@ apiRouter.post('/tlo/sync-session', (req, res) => {
     startNumber: startNumber ? Number(startNumber) : 1,
     includeBillText: includeBillText !== false,
     includeWitnesses: includeWitnesses !== undefined ? Boolean(includeWitnesses) : undefined,
+    includeDocuments: includeDocuments !== undefined ? Boolean(includeDocuments) : undefined,
     skipUnchanged: skipUnchanged !== false,
     concurrency: concurrency ? Number(concurrency) : 4,
   });
@@ -2136,4 +2181,729 @@ apiRouter.get('/statutes/:id/diff', (req, res) => {
     ...diff,
   });
 });
+
+// 13. Multi-Track Session Timeline, Policy Cohorts & Consolidation Tracker
+const MONTH_LOOKUP: Record<string, string> = {
+  jan: '01', january: '01',
+  feb: '02', february: '02',
+  mar: '03', march: '03',
+  apr: '04', april: '04',
+  may: '05',
+  jun: '06', june: '06',
+  jul: '07', july: '07',
+  aug: '08', august: '08',
+  sep: '09', sept: '09', september: '09',
+  oct: '10', october: '10',
+  nov: '11', november: '11',
+  dec: '12', december: '12',
+};
+
+function parseFlexibleIsoDate(raw: string): string {
+  const direct = normalizeIsoDate(raw);
+  if (direct) return direct;
+  const named = (raw || '').trim().match(/^([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})/);
+  if (named) {
+    const mm = MONTH_LOOKUP[named[1].toLowerCase()];
+    if (mm) return `${named[3]}-${mm}-${named[2].padStart(2, '0')}`;
+  }
+  return '';
+}
+
+function isoDateToEpochMs(iso: string): number {
+  const t = Date.parse(`${iso}T12:00:00Z`);
+  return Number.isNaN(t) ? 0 : t;
+}
+
+function normalizeStatuteKey(codeStr: string): string {
+  return codeStr
+    .replace(/\bSubch\.\s*[A-Z0-9]+\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+apiRouter.get('/timeline', (req, res) => {
+  const sessionParam = String(req.query.session ?? '').trim();
+  const q = String(req.query.q ?? '').trim().toLowerCase();
+  const committeeFilter = String(req.query.committee ?? '').trim();
+  const requestedFocus = String(req.query.focusBillId ?? '').trim();
+
+  const billRows = db
+    .prepare(
+      `SELECT id, session, bill_number, chamber, title, summary, statute_codes, status, stage,
+              primary_author, committees_json, subjects_json, filed_date, last_action_date,
+              amendment_count, influence_score
+       FROM bills
+       ${sessionParam ? 'WHERE session = ?' : ''}
+       ORDER BY influence_score DESC, last_action_date DESC
+       LIMIT 350`
+    )
+    .all(...(sessionParam ? [sessionParam] : [])) as Array<{
+    id: string;
+    session: string;
+    bill_number: string;
+    chamber: Chamber;
+    title: string;
+    summary: string;
+    statute_codes: string;
+    status: string;
+    stage: BillStage;
+    primary_author: string;
+    committees_json: string;
+    subjects_json: string;
+    filed_date: string;
+    last_action_date: string;
+    amendment_count: number;
+    influence_score: number;
+  }>;
+
+  const parsedBills = billRows.map((r) => {
+    const committees = JSON.parse(safeStr(r.committees_json, '[]')) as Array<{
+      name: string;
+      chamber: Chamber;
+      status: string;
+    }>;
+    const subjects = JSON.parse(safeStr(r.subjects_json, '[]')) as string[];
+    const statuteCodes = JSON.parse(safeStr(r.statute_codes, '[]')) as string[];
+    const tokens = extractBillTokens({
+      title: r.title,
+      summary: r.summary,
+      subjects_json: r.subjects_json,
+      statute_codes: r.statute_codes,
+    });
+    const isBudgetBill = /^(SB|HB)\s*1$/i.test(r.bill_number.trim());
+
+    return {
+      ...r,
+      committees,
+      subjects,
+      statuteCodes,
+      statuteKeys: statuteCodes
+        .map(normalizeStatuteKey)
+        .filter((sk) => Boolean(sk) && /\d/.test(sk)),
+      tokens,
+      tokenSet: new Set(tokens),
+      isBudgetBill,
+      isoFiledDate: parseFlexibleIsoDate(r.filed_date) || '2025-01-15',
+      isoLastDate: parseFlexibleIsoDate(r.last_action_date) || parseFlexibleIsoDate(r.filed_date) || '2025-01-15',
+    };
+  });
+
+  // Collect committees across evaluated session bills
+  const committeeSet = new Set<string>();
+  for (const b of parsedBills) {
+    for (const c of b.committees) {
+      if (c.name) committeeSet.add(c.name);
+    }
+  }
+
+  // Apply keyword + committee filters for focused subset while keeping full cohort graph intact
+  const filteredBills = parsedBills.filter((b) => {
+    if (committeeFilter && !b.committees.some((c) => c.name === committeeFilter)) {
+      return false;
+    }
+    if (q) {
+      const hay = `${b.bill_number} ${b.session} ${b.title} ${b.summary} ${b.primary_author} ${b.subjects.join(' ')} ${b.statuteCodes.join(' ')}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+
+  const billById = new Map(parsedBills.map((b) => [b.id, b]));
+  const filteredIds = new Set(filteredBills.map((b) => b.id));
+
+  const focusBillId =
+    requestedFocus && billById.has(requestedFocus)
+      ? requestedFocus
+      : filteredBills[0]?.id ?? parsedBills[0]?.id ?? '';
+
+  // Load explicit bill_links touching evaluated bills
+  const allLinks = db
+    .prepare(`SELECT id, source_bill_id, target_bill_id, link_type, notes FROM bill_links`)
+    .all() as Array<{
+    id: string;
+    source_bill_id: string;
+    target_bill_id: string;
+    link_type: string;
+    notes: string;
+  }>;
+
+  const explicitEdges: Array<{ a: string; b: string; linkType: string; notes: string }> = [];
+  for (const l of allLinks) {
+    if (billById.has(l.source_bill_id) && billById.has(l.target_bill_id)) {
+      explicitEdges.push({
+        a: l.source_bill_id,
+        b: l.target_bill_id,
+        linkType: l.link_type,
+        notes: l.notes,
+      });
+    }
+  }
+
+  // Union-Find to cluster Policy Cohorts (companions, shared statute chapters, >=3 domain tokens)
+  const parent = new Map<string, string>();
+  for (const b of parsedBills) parent.set(b.id, b.id);
+  const find = (x: string): string => {
+    let cur = x;
+    while (parent.get(cur) !== cur) {
+      cur = parent.get(cur) ?? cur;
+    }
+    return cur;
+  };
+  const union = (x: string, y: string) => {
+    const rx = find(x);
+    const ry = find(y);
+    if (rx !== ry) parent.set(ry, rx);
+  };
+
+  for (const edge of explicitEdges) {
+    // Do not merge unrelated policy clusters purely through mega-budget rider links
+    const ba = billById.get(edge.a);
+    const bb = billById.get(edge.b);
+    if (ba && bb && !ba.isBudgetBill && !bb.isBudgetBill) {
+      union(edge.a, edge.b);
+    }
+  }
+
+  for (let i = 0; i < parsedBills.length; i++) {
+    const a = parsedBills[i];
+    if (a.isBudgetBill) continue;
+    for (let j = i + 1; j < parsedBills.length; j++) {
+      const b = parsedBills[j];
+      if (b.isBudgetBill) continue;
+      if (a.session !== b.session) continue;
+
+      const sharedStatutes = a.statuteKeys.filter((sk) => b.statuteKeys.includes(sk));
+      const sharedTokens = a.tokens.filter((t) => b.tokenSet.has(t));
+      if (sharedStatutes.length > 0 || sharedTokens.length >= 3) {
+        union(a.id, b.id);
+      }
+    }
+  }
+
+  // Build cohort groups from components with >= 2 bills
+  const groups = new Map<string, typeof parsedBills>();
+  for (const b of parsedBills) {
+    const root = find(b.id);
+    const list = groups.get(root);
+    if (list) list.push(b);
+    else groups.set(root, [b]);
+  }
+
+  const cohorts: TimelineCohort[] = [];
+  const billToCohortIds = new Map<string, Set<string>>();
+
+  for (const [rootId, members] of groups.entries()) {
+    if (members.length < 2) continue;
+    // If filters are active, include cohorts touching at least one filtered bill
+    if ((q || committeeFilter) && !members.some((m) => filteredIds.has(m.id))) continue;
+
+    const subjectFreq = new Map<string, number>();
+    const statuteFreq = new Map<string, number>();
+    const tokenFreq = new Map<string, number>();
+
+    for (const m of members) {
+      for (const s of m.subjects) subjectFreq.set(s, (subjectFreq.get(s) ?? 0) + 1);
+      for (const st of m.statuteCodes) statuteFreq.set(st, (statuteFreq.get(st) ?? 0) + 1);
+      for (const t of m.tokens) tokenFreq.set(t, (tokenFreq.get(t) ?? 0) + 1);
+    }
+
+    const topSharedSubjects = Array.from(subjectFreq.entries())
+      .filter(([, c]) => c >= 2)
+      .sort((a, b) => b[1] - a[1])
+      .map(([s]) => s);
+    const topSharedStatutes = Array.from(statuteFreq.entries())
+      .filter(([, c]) => c >= 2)
+      .sort((a, b) => b[1] - a[1])
+      .map(([s]) => s);
+    const topSharedTokens = Array.from(tokenFreq.entries())
+      .filter(([, c]) => c >= 2)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([t]) => t);
+
+    const cohortLinks = explicitEdges.filter(
+      (e) => members.some((m) => m.id === e.a) && members.some((m) => m.id === e.b)
+    );
+
+    const topicLabel =
+      topSharedSubjects[0] ||
+      topSharedStatutes[0] ||
+      (topSharedTokens.length
+        ? topSharedTokens.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' & ')
+        : `${members[0].session} ${members[0].bill_number} Cluster`);
+
+    const basisParts: string[] = [];
+    if (cohortLinks.length > 0) {
+      basisParts.push(`Explicit ${cohortLinks[0].linkType} Link`);
+    }
+    if (topSharedStatutes.length > 0) {
+      basisParts.push(`Shared Statute: ${topSharedStatutes.slice(0, 2).join(', ')}`);
+    } else if (topSharedTokens.length > 0) {
+      basisParts.push(`Keywords: ${topSharedTokens.join(', ')}`);
+    }
+
+    const memberIds = new Set(members.map((m) => m.id));
+    for (const m of members) {
+      billToCohortIds.set(m.id, memberIds);
+    }
+
+    const mappedMembers: TimelineCohortBill[] = members
+      .slice()
+      .sort((a, b) => a.isoFiledDate.localeCompare(b.isoFiledDate) || b.influence_score - a.influence_score)
+      .map((m) => {
+        let roleInCohort: TimelineCohortBill['roleInCohort'] = 'Advancing';
+        if (m.stage === 'Signed' || m.stage === 'Enrolled') roleInCohort = 'Vehicle / Enacted';
+        else if (m.stage === 'Stalled') roleInCohort = 'Stalled / Pending';
+        else if (m.stage === 'Pre-Filed') roleInCohort = 'Pre-Filed';
+
+        return {
+          id: m.id,
+          billNumber: m.bill_number,
+          session: m.session,
+          chamber: m.chamber,
+          title: m.title,
+          stage: m.stage,
+          filedDate: m.isoFiledDate,
+          lastActionDate: m.isoLastDate,
+          primaryAuthor: m.primary_author,
+          amendmentCount: m.amendment_count,
+          roleInCohort,
+        };
+      });
+
+    const earliestFiled = mappedMembers.reduce(
+      (min, m) => (m.filedDate < min ? m.filedDate : min),
+      mappedMembers[0].filedDate
+    );
+    const latestAction = mappedMembers.reduce(
+      (max, m) => (m.lastActionDate > max ? m.lastActionDate : max),
+      mappedMembers[0].lastActionDate
+    );
+
+    cohorts.push({
+      id: `coh-${rootId}`,
+      topicLabel,
+      sharedBasis: basisParts.join(' · ') || 'Multi-bill subject alignment',
+      earliestFiled,
+      latestAction,
+      bills: mappedMembers,
+    });
+  }
+  cohorts.sort((a, b) => b.bills.length - a.bills.length || a.earliestFiled.localeCompare(b.earliestFiled));
+
+  // Preload amendments & bill_documents for evaluated bills (efficient batch queries)
+  const amendmentsByBill = new Map<
+    string,
+    Array<{
+      id: string;
+      versionCode: string;
+      versionLabel: string;
+      amendmentNumber: string;
+      sponsor: string;
+      filedDate: string;
+      disposition: string;
+      summary: string;
+      fullText: string;
+      sortOrder: number;
+    }>
+  >();
+
+  const allAmends = db
+    .prepare(
+      `SELECT id, bill_id AS billId, version_code AS versionCode, version_label AS versionLabel,
+              amendment_number AS amendmentNumber, sponsor, filed_date AS filedDate,
+              disposition, summary, full_text AS fullText, sort_order AS sortOrder
+       FROM amendments
+       ORDER BY sort_order ASC, filed_date ASC`
+    )
+    .all() as Array<{
+    id: string;
+    billId: string;
+    versionCode: string;
+    versionLabel: string;
+    amendmentNumber: string;
+    sponsor: string;
+    filedDate: string;
+    disposition: string;
+    summary: string;
+    fullText: string;
+    sortOrder: number;
+  }>;
+
+  for (const am of allAmends) {
+    if (!billById.has(am.billId)) continue;
+    const list = amendmentsByBill.get(am.billId);
+    if (list) list.push(am);
+    else amendmentsByBill.set(am.billId, [am]);
+  }
+
+  const docsByBill = new Map<string, BillDocument[]>();
+  const allDocs = db
+    .prepare(
+      `SELECT id, bill_id AS billId, doc_type AS docType, version_code AS versionCode,
+              version_label AS versionLabel, title, summary, full_text AS fullText, source
+       FROM bill_documents`
+    )
+    .all() as BillDocument[];
+
+  for (const d of allDocs) {
+    if (!billById.has(d.billId)) continue;
+    const list = docsByBill.get(d.billId);
+    if (list) list.push(d);
+    else docsByBill.set(d.billId, [d]);
+  }
+
+  // Detect Consolidation & Absorption Signals (stalled/early bills vs. advancing committee-substitute vehicles)
+  const consolidations: TimelineConsolidation[] = [];
+  const stalledCandidates = parsedBills.filter(
+    (b) => b.stage === 'Stalled' || b.stage === 'Filed' || b.stage === 'Committee Hearing'
+  );
+  const vehicleCandidates = parsedBills.filter(
+    (b) =>
+      (b.stage === 'Committee Reported' || b.stage === 'Engrossed' || b.stage === 'Enrolled' || b.stage === 'Signed') &&
+      (amendmentsByBill.get(b.id)?.length ?? 0) >= 2
+  );
+
+  const seenPairs = new Set<string>();
+  for (const st of stalledCandidates) {
+    for (const veh of vehicleCandidates) {
+      if (st.id === veh.id) continue;
+      if ((q || committeeFilter) && !filteredIds.has(st.id) && !filteredIds.has(veh.id)) continue;
+
+      const pairKey = `${st.id}::${veh.id}`;
+      if (seenPairs.has(pairKey)) continue;
+
+      const explicitLink = explicitEdges.find(
+        (e) => (e.a === st.id && e.b === veh.id) || (e.a === veh.id && e.b === st.id)
+      );
+      const sharedComm = st.committees.find((sc) => veh.committees.some((vc) => vc.name === sc.name));
+      const sharedStatutes = st.statuteCodes.filter((sCode) =>
+        veh.statuteKeys.includes(normalizeStatuteKey(sCode))
+      );
+      const sharedTokens = st.tokens.filter((t) => veh.tokenSet.has(t));
+
+      const qualifiesExplicit = Boolean(explicitLink);
+      const qualifiesIntraSession =
+        st.session === veh.session &&
+        !st.isBudgetBill &&
+        !veh.isBudgetBill &&
+        Boolean(sharedComm) &&
+        (sharedStatutes.length > 0 || sharedTokens.length >= 2);
+
+      if (!qualifiesExplicit && !qualifiesIntraSession) continue;
+      seenPairs.add(pairKey);
+
+      const vehVersions = amendmentsByBill.get(veh.id) ?? [];
+      const firstVer = vehVersions[0];
+      const latestVer = vehVersions[vehVersions.length - 1];
+      const diff =
+        firstVer && latestVer && firstVer.id !== latestVer.id
+          ? computeLineDiff(firstVer.fullText, latestVer.fullText)
+          : { lines: [], addedCount: 0, removedCount: 0, unchangedCount: 0 };
+      const addedLinePreviews = diff.lines
+        .filter((l) => l.type === 'added')
+        .map((l) => l.text)
+        .slice(0, 4);
+
+      const vehDocs = docsByBill.get(veh.id) ?? [];
+      const analysisDoc = vehDocs.find((d) => d.docType === 'analysis') ?? vehDocs[0];
+
+      const basisParts: string[] = [];
+      if (explicitLink) basisParts.push(`${explicitLink.linkType} link`);
+      if (sharedComm) basisParts.push(`Same committee (${sharedComm.name})`);
+      if (sharedStatutes.length > 0) basisParts.push(`Shared statute (${sharedStatutes[0]})`);
+      else if (sharedTokens.length > 0) basisParts.push(`Shared terms: ${sharedTokens.slice(0, 3).join(', ')}`);
+
+      consolidations.push({
+        id: `cons-${st.id}-${veh.id}`,
+        stalledBillId: st.id,
+        stalledBillNumber: `${st.session} ${st.bill_number}`,
+        stalledTitle: st.title,
+        stalledDate: st.isoLastDate,
+        stalledStage: st.stage,
+        vehicleBillId: veh.id,
+        vehicleBillNumber: `${veh.session} ${veh.bill_number}`,
+        vehicleTitle: veh.title,
+        vehicleDate: latestVer ? parseFlexibleIsoDate(latestVer.filedDate) || veh.isoLastDate : veh.isoLastDate,
+        vehicleStage: veh.stage,
+        committee: sharedComm?.name ?? veh.committees[0]?.name ?? 'Committee Vehicle',
+        basis: basisParts.join(' · '),
+        sharedStatutes: sharedStatutes.length ? sharedStatutes : sharedTokens.slice(0, 3),
+        addedLinePreviews,
+        addedCount: diff.addedCount,
+        removedCount: diff.removedCount,
+        analysisNote: analysisDoc?.summary || latestVer?.summary || '',
+      });
+    }
+  }
+  consolidations.sort((a, b) => b.addedCount - a.addedCount || b.vehicleDate.localeCompare(a.vehicleDate));
+
+  // Build Synchronized Multi-Track Chronological Events
+  const focusCohortSet = new Set<string>(billToCohortIds.get(focusBillId) ?? []);
+  for (const e of explicitEdges) {
+    if (e.a === focusBillId) focusCohortSet.add(e.b);
+    if (e.b === focusBillId) focusCohortSet.add(e.a);
+  }
+
+  const events: TimelineEventItem[] = [];
+
+  for (const b of filteredBills) {
+    const track: TimelineEventItem['track'] =
+      b.id === focusBillId ? 'focus' : focusCohortSet.has(b.id) ? 'cohort' : 'session';
+    const primaryCommittee = b.committees[0]?.name ?? 'General Calendar';
+
+    // 1. Filing / Pre-filing event
+    events.push({
+      id: `evt-file-${b.id}`,
+      date: b.isoFiledDate,
+      billId: b.id,
+      billNumber: b.bill_number,
+      session: b.session,
+      billTitle: b.title,
+      stage: b.stage,
+      committee: primaryCommittee,
+      kind: 'filing',
+      track,
+      title: `${b.session} ${b.bill_number} ${b.stage === 'Pre-Filed' ? 'Pre-Filed' : 'Filed'} (${b.primary_author})`,
+      detail: b.title,
+      concurrentEventsCount: 0,
+    });
+
+    // 2. Witness hearing events grouped by committee + hearing date
+    const witRows = db
+      .prepare(
+        `SELECT committee_name AS committeeName, hearing_date AS hearingDate,
+                position, is_citizen_self AS isCitizenSelf
+         FROM witness_registrations WHERE bill_id = ?`
+      )
+      .all(b.id) as Array<{
+      committeeName: string;
+      hearingDate: string;
+      position: string;
+      isCitizenSelf: number;
+    }>;
+
+    const hearingMap = new Map<
+      string,
+      { committeeName: string; isoDate: string; total: number; forC: number; againstC: number; selfC: number }
+    >();
+    for (const w of witRows) {
+      const iso = parseFlexibleIsoDate(w.hearingDate);
+      if (!iso) continue;
+      const key = `${w.committeeName}::${iso}`;
+      const cur = hearingMap.get(key) ?? {
+        committeeName: w.committeeName,
+        isoDate: iso,
+        total: 0,
+        forC: 0,
+        againstC: 0,
+        selfC: 0,
+      };
+      cur.total++;
+      if (w.position === 'For') cur.forC++;
+      if (w.position === 'Against') cur.againstC++;
+      if (w.isCitizenSelf === 1) cur.selfC++;
+      hearingMap.set(key, cur);
+    }
+
+    for (const h of hearingMap.values()) {
+      events.push({
+        id: `evt-wit-${b.id}-${h.isoDate}-${h.committeeName}`,
+        date: h.isoDate,
+        billId: b.id,
+        billNumber: b.bill_number,
+        session: b.session,
+        billTitle: b.title,
+        stage: b.stage,
+        committee: h.committeeName,
+        kind: 'hearing',
+        track,
+        title: `${b.session} ${b.bill_number} Public Hearing — ${h.committeeName}`,
+        detail: `${h.total} witness registrations (${h.forC} For, ${h.againstC} Against, ${h.selfC} Citizen Self)`,
+        witnessCount: h.total,
+        citizenSelfCount: h.selfC,
+        concurrentEventsCount: 0,
+      });
+    }
+
+    // Load bill_actions once per bill for both version-date fallback and timeline actions
+    const actions = db
+      .prepare(
+        `SELECT id, action_date AS actionDate, action_number AS actionNumber, description
+         FROM bill_actions WHERE bill_id = ? ORDER BY action_date ASC`
+      )
+      .all(b.id) as Array<{ id: string; actionDate: string; actionNumber: string; description: string }>;
+
+    // 3. Substitutes / Floor Amendments with line-by-line diffs & attached TLO documents
+    const billAmends = amendmentsByBill.get(b.id) ?? [];
+    const billDocs = docsByBill.get(b.id) ?? [];
+    for (let idx = 0; idx < billAmends.length; idx++) {
+      const am = billAmends[idx];
+      if (idx === 0 && am.versionCode === 'I') continue;
+      const prevAm = idx > 0 ? billAmends[idx - 1] : null;
+      let amDate = parseFlexibleIsoDate(am.filedDate) || b.isoLastDate;
+      if (amDate === b.isoFiledDate && actions.length > 0) {
+        const matchedAct =
+          am.versionCode === 'H'
+            ? actions.find((a) => /committee substitute|reported favorably/i.test(a.description))
+            : am.versionCode === 'E'
+              ? actions.find((a) => /engrossed|passed/i.test(a.description))
+              : am.versionCode === 'S'
+                ? actions.find((a) => a.actionNumber.startsWith('S') && /reported favorably/i.test(a.description))
+                : am.versionCode === 'F'
+                  ? actions.find((a) => /enrolled|signed by the governor/i.test(a.description))
+                  : undefined;
+        if (matchedAct) {
+          amDate = parseFlexibleIsoDate(matchedAct.actionDate) || amDate;
+        }
+      }
+      const diff = prevAm ? computeLineDiff(prevAm.fullText, am.fullText) : null;
+
+      const matchingDoc =
+        billDocs.find((d) => d.versionCode === am.versionCode) ??
+        billDocs.find((d) => d.docType === 'analysis') ??
+        billDocs[0];
+
+      events.push({
+        id: `evt-am-${am.id}`,
+        date: amDate,
+        billId: b.id,
+        billNumber: b.bill_number,
+        session: b.session,
+        billTitle: b.title,
+        stage: b.stage,
+        committee: primaryCommittee,
+        kind: 'substitute',
+        track,
+        title: `${b.session} ${b.bill_number} ${am.versionLabel} (${am.disposition})`,
+        detail: am.summary,
+        diffMeta:
+          diff && prevAm
+            ? {
+                fromLabel: prevAm.versionLabel,
+                toLabel: am.versionLabel,
+                addedCount: diff.addedCount,
+                removedCount: diff.removedCount,
+                addedLines: diff.lines.filter((l) => l.type === 'added').map((l) => l.text).slice(0, 6),
+                removedLines: diff.lines.filter((l) => l.type === 'removed').map((l) => l.text).slice(0, 4),
+              }
+            : undefined,
+        documentNote: matchingDoc
+          ? {
+              docType: matchingDoc.docType,
+              versionLabel: matchingDoc.versionLabel,
+              summary: matchingDoc.summary,
+            }
+          : undefined,
+        concurrentEventsCount: 0,
+      });
+    }
+
+    // 4. Key procedural actions (stalls, referrals, committee reports, enactments)
+
+    for (const act of actions) {
+      const iso = parseFlexibleIsoDate(act.actionDate) || b.isoLastDate;
+      const descLower = act.description.toLowerCase();
+      // Skip redundant initial filing if same date as filed event
+      if (iso === b.isoFiledDate && (descLower.startsWith('filed') || descLower.startsWith('pre-filed'))) {
+        continue;
+      }
+      let kind: TimelineEventItem['kind'] = 'action';
+      if (
+        descLower.includes('stalled') ||
+        descLower.includes('left pending') ||
+        descLower.includes('vetoed') ||
+        descLower.includes('failed') ||
+        descLower.includes('tabled')
+      ) {
+        kind = 'stalled';
+      } else if (
+        descLower.includes('signed by the governor') ||
+        descLower.includes('enrolled') ||
+        descLower.includes('conference committee report adopted')
+      ) {
+        kind = 'enacted';
+      }
+
+      events.push({
+        id: `evt-act-${act.id}`,
+        date: iso,
+        billId: b.id,
+        billNumber: b.bill_number,
+        session: b.session,
+        billTitle: b.title,
+        stage: b.stage,
+        committee: primaryCommittee,
+        kind,
+        track,
+        title: `${b.session} ${b.bill_number} · ${act.description}`,
+        detail: `Action ${act.actionNumber || 'TLO'} · Stage: ${b.stage}`,
+        concurrentEventsCount: 0,
+      });
+    }
+  }
+
+  const kindOrder: Record<TimelineEventItem['kind'], number> = {
+    filing: 1,
+    hearing: 2,
+    substitute: 3,
+    action: 4,
+    stalled: 5,
+    enacted: 6,
+  };
+
+  events.sort((a, b) => {
+    const dCmp = a.date.localeCompare(b.date);
+    if (dCmp !== 0) return dCmp;
+    const tRank = (t: TimelineEventItem['track']) => (t === 'focus' ? 0 : t === 'cohort' ? 1 : 2);
+    const trCmp = tRank(a.track) - tRank(b.track);
+    if (trCmp !== 0) return trCmp;
+    return kindOrder[a.kind] - kindOrder[b.kind];
+  });
+
+  // Compute +/- 3-day concurrent activity window counts across other bills
+  const epochs = events.map((ev) => isoDateToEpochMs(ev.date));
+  const THREE_DAYS_MS = 3 * 86400 * 1000;
+  let concurrentWindows = 0;
+
+  for (let i = 0; i < events.length; i++) {
+    const ei = epochs[i];
+    if (!ei) continue;
+    const seenOtherBills = new Set<string>();
+    for (let j = 0; j < events.length; j++) {
+      if (events[j].billId === events[i].billId) continue;
+      const ej = epochs[j];
+      if (!ej) continue;
+      if (Math.abs(ei - ej) <= THREE_DAYS_MS) {
+        seenOtherBills.add(events[j].billId);
+      }
+    }
+    events[i].concurrentEventsCount = seenOtherBills.size;
+    if (seenOtherBills.size > 0) concurrentWindows++;
+  }
+
+  res.json({
+    session: sessionParam || 'ALL',
+    focusBillId,
+    totals: {
+      billsEvaluated: filteredBills.length,
+      cohortsDetected: cohorts.length,
+      consolidationsDetected: consolidations.length,
+      timelineEvents: events.length,
+      concurrentWindows,
+    },
+    cohorts,
+    consolidations,
+    events: events.slice(0, 260),
+    availableBills: parsedBills.slice(0, 120).map((b) => ({
+      id: b.id,
+      billNumber: b.bill_number,
+      session: b.session,
+      title: b.title,
+    })),
+    availableCommittees: Array.from(committeeSet).sort((a, b) => a.localeCompare(b)),
+  });
+});
+
 

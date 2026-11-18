@@ -159,6 +159,18 @@ export interface PublicSentimentSummary {
   constituentAmendVolume: number;
 }
 
+export interface BillDocument {
+  id: string;
+  billId: string;
+  docType: 'analysis' | 'fiscal_note';
+  versionCode: string;
+  versionLabel: string;
+  title: string;
+  summary: string;
+  fullText: string;
+  source: string;
+}
+
 export interface BillDetail extends BillSummary {
   fullText: string;
   amendments: BillAmendment[];
@@ -168,6 +180,7 @@ export interface BillDetail extends BillSummary {
   witnesses: WitnessRegistration[];
   constituentLogs: ConstituentCommunication[];
   publicSentiment: PublicSentimentSummary;
+  documents?: BillDocument[];
 }
 
 export interface DiffLine {
@@ -192,7 +205,7 @@ export interface PoliticianSummary {
   shortName: string;
   chamber: Chamber;
   district: string;
-  party: 'R' | 'D';
+  party: 'R' | 'D' | '—';
   tenureYears: number;
   leadershipRole: string;
   bio: string;
@@ -470,4 +483,97 @@ export interface StatuteSectionDetail extends StatuteSectionSummary {
     stage: string;
   }>;
 }
+
+export interface TimelineCohortBill {
+  id: string;
+  billNumber: string;
+  session: string;
+  chamber: Chamber;
+  title: string;
+  stage: BillStage;
+  filedDate: string;
+  lastActionDate: string;
+  primaryAuthor: string;
+  amendmentCount: number;
+  roleInCohort: 'Vehicle / Enacted' | 'Advancing' | 'Stalled / Pending' | 'Pre-Filed';
+}
+
+export interface TimelineCohort {
+  id: string;
+  topicLabel: string;
+  sharedBasis: string;
+  earliestFiled: string;
+  latestAction: string;
+  bills: TimelineCohortBill[];
+}
+
+export interface TimelineConsolidation {
+  id: string;
+  stalledBillId: string;
+  stalledBillNumber: string;
+  stalledTitle: string;
+  stalledDate: string;
+  stalledStage: string;
+  vehicleBillId: string;
+  vehicleBillNumber: string;
+  vehicleTitle: string;
+  vehicleDate: string;
+  vehicleStage: string;
+  committee: string;
+  basis: string;
+  sharedStatutes: string[];
+  addedLinePreviews: string[];
+  addedCount: number;
+  removedCount: number;
+  analysisNote: string;
+}
+
+export interface TimelineEventItem {
+  id: string;
+  date: string;
+  billId: string;
+  billNumber: string;
+  session: string;
+  billTitle: string;
+  stage: BillStage;
+  committee: string;
+  kind: 'filing' | 'hearing' | 'substitute' | 'stalled' | 'enacted' | 'action';
+  track: 'focus' | 'cohort' | 'session';
+  title: string;
+  detail: string;
+  witnessCount?: number;
+  citizenSelfCount?: number;
+  diffMeta?: {
+    fromLabel: string;
+    toLabel: string;
+    addedCount: number;
+    removedCount: number;
+    addedLines: string[];
+    removedLines: string[];
+  };
+  documentNote?: {
+    docType: 'analysis' | 'fiscal_note';
+    versionLabel: string;
+    summary: string;
+  };
+  concurrentEventsCount: number;
+}
+
+export interface SessionTimelineResponse {
+  session: string;
+  focusBillId: string;
+  totals: {
+    billsEvaluated: number;
+    cohortsDetected: number;
+    consolidationsDetected: number;
+    timelineEvents: number;
+    concurrentWindows: number;
+  };
+  cohorts: TimelineCohort[];
+  consolidations: TimelineConsolidation[];
+  events: TimelineEventItem[];
+  availableBills: Array<{ id: string; billNumber: string; session: string; title: string }>;
+  availableCommittees: string[];
+}
+
 

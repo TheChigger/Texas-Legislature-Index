@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Header, type ActiveView } from './components/Header.tsx';
 import { LegislationView } from './components/LegislationView.tsx';
+import { TimelineView } from './components/TimelineView.tsx';
 import { PoliticiansView } from './components/PoliticiansView.tsx';
 import { NetworkMapView } from './components/NetworkMapView.tsx';
 import { AmendmentsView } from './components/AmendmentsView.tsx';
@@ -32,12 +33,13 @@ export default function App() {
   useEffect(() => {
     const VIEW_KEYS: Record<string, ActiveView> = {
       '1': 'legislation',
-      '2': 'politicians',
-      '3': 'receptivity',
-      '4': 'network',
-      '5': 'amendments',
-      '6': 'statutes',
-      '7': 'alerts',
+      '2': 'timeline',
+      '3': 'politicians',
+      '4': 'receptivity',
+      '5': 'network',
+      '6': 'amendments',
+      '7': 'statutes',
+      '8': 'alerts',
     };
 
     const focusPrimarySearch = () => {
@@ -250,12 +252,22 @@ export default function App() {
           />
         )}
 
+        {activeView === 'timeline' && (
+          <TimelineView
+            activeSession={activeSession}
+            onOpenBill={handleOpenBill}
+            refreshSignal={refreshSignal}
+          />
+        )}
+
         {activeView === 'politicians' && (
           <PoliticiansView
             selectedPoliticianId={selectedPoliticianId}
             onSelectPolitician={setSelectedPoliticianId}
             onOpenBill={handleOpenBill}
             onInspectInNetwork={handleInspectInNetwork}
+            activeSession={activeSession}
+            onDataMutated={triggerRefresh}
           />
         )}
 

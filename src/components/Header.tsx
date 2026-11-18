@@ -2,6 +2,7 @@ import React from 'react';
 
 export type ActiveView =
   | 'legislation'
+  | 'timeline'
   | 'politicians'
   | 'receptivity'
   | 'network'
@@ -24,6 +25,7 @@ export const Header: React.FC<HeaderProps> = ({
 }) => {
   const navItems: Array<{ id: ActiveView; label: string }> = [
     { id: 'legislation', label: 'Legislation' },
+    { id: 'timeline', label: 'Timeline' },
     { id: 'politicians', label: 'Politicians' },
     { id: 'receptivity', label: 'Receptivity' },
     { id: 'network', label: 'Network Map' },
@@ -37,7 +39,7 @@ export const Header: React.FC<HeaderProps> = ({
 
   return (
     <header className="sticky top-0 z-30 bg-[#FBF9F5]/95 backdrop-blur-sm border-b border-[#DFD9CE]">
-      <div className="max-w-[1440px] mx-auto px-6 h-16 flex items-center justify-between gap-8">
+      <div className="max-w-[1440px] mx-auto px-6 h-16 flex items-center justify-between gap-6">
         <button
           type="button"
           onClick={() => onNavigate('legislation')}
@@ -46,7 +48,7 @@ export const Header: React.FC<HeaderProps> = ({
           Texas Capitol Ledger
         </button>
 
-        <nav className="flex items-center gap-6 overflow-x-auto" aria-label="Primary navigation">
+        <nav className="flex items-center gap-5 overflow-x-auto" aria-label="Primary navigation">
           {navItems.map((item) => {
             const isActive = activeView === item.id;
             return (

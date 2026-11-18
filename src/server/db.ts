@@ -301,7 +301,35 @@ export function initSchema(): void {
     );
 
     CREATE INDEX IF NOT EXISTS idx_statute_snap_sec ON statute_snapshots(section_id, snapshot_date);
+
+    CREATE TABLE IF NOT EXISTS bill_documents (
+      id TEXT PRIMARY KEY,
+      bill_id TEXT NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+      doc_type TEXT NOT NULL,
+      version_code TEXT NOT NULL,
+      version_label TEXT NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      summary TEXT NOT NULL DEFAULT '',
+      full_text TEXT NOT NULL DEFAULT '',
+      source TEXT NOT NULL DEFAULT ''
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_bill_docs_bill ON bill_documents(bill_id);
   `);
+}
+
+export function normalizeIsoDate(raw: string): string {
+  const s = (raw || '').trim();
+  if (!s) return '';
+  const iso = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (iso) {
+    return `${iso[1]}-${iso[2].padStart(2, '0')}-${iso[3].padStart(2, '0')}`;
+  }
+  const us = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (us) {
+    return `${us[3]}-${us[1].padStart(2, '0')}-${us[2].padStart(2, '0')}`;
+  }
+  return s;
 }
 
 export function syncBillFts(billId: string): void {
@@ -647,3 +675,175 @@ export function evaluateAlertRules(targetBillId?: string): number {
 
   return inserted;
 }
+
+export function slugifyLegislatorName(raw: string): string {
+  return raw
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+export interface UpsertLegislatorInput {
+  shortName: string;
+  chamber: 'House' | 'Senate';
+  fullName?: string;
+  session?: string;
+  billsAuthored?: number;
+  billsPassed?: number;
+  bio?: string;
+}
+
+export function upsertLegislatorRecord(input: UpsertLegislatorInput): boolean {
+  const shortName = input.shortName.replace(/\s+/g, ' ').trim();
+  if (!shortName || /^(unassigned|et al\.?|committee|unknown)$/i.test(shortName)) {
+    return false;
+  }
+
+  const chamber = input.chamber === 'Senate' ? 'Senate' : 'House';
+  const titlePrefix = chamber === 'Senate' ? 'Sen.' : 'Rep.';
+  const cleanFull = input.fullName ? input.fullName.replace(/\s+/g, ' ').trim() : '';
+  const displayName = cleanFull ? `${titlePrefix} ${cleanFull}` : `${titlePrefix} ${shortName}`;
+
+  const existing = db
+    .prepare(
+      `SELECT id, name, short_name, bills_authored, bills_passed, leadership_role
+       FROM politicians
+       WHERE LOWER(short_name) = LOWER(?) AND chamber = ?`
+    )
+    .get(shortName, chamber) as
+    | {
+        id: string;
+        name: string;
+        short_name: string;
+        bills_authored: number;
+        bills_passed: number;
+        leadership_role: string;
+      }
+    | undefined;
+
+  if (existing) {
+    const nextAuthored = Math.max(existing.bills_authored || 0, input.billsAuthored ?? 0);
+    const nextPassed = Math.max(existing.bills_passed || 0, input.billsPassed ?? 0);
+    // Only replace auto-generated short placeholder name (e.g. "Rep. Capriglione") if we now have full first+last name
+    const isAutoPlaceholder =
+      existing.name.toLowerCase() === `${titlePrefix.toLowerCase()} ${existing.short_name.toLowerCase()}`;
+    const nextName = cleanFull && isAutoPlaceholder ? displayName : existing.name;
+    const nextRole =
+      existing.leadership_role || (input.session ? `Member (${input.session})` : '');
+
+    if (
+      nextName !== existing.name ||
+      nextAuthored !== existing.bills_authored ||
+      nextPassed !== existing.bills_passed ||
+      nextRole !== existing.leadership_role
+    ) {
+      db.prepare(
+        `UPDATE politicians
+         SET name = ?, bills_authored = ?, bills_passed = ?, leadership_role = ?
+         WHERE id = ?`
+      ).run(nextName, nextAuthored, nextPassed, nextRole, existing.id);
+    }
+    return false;
+  }
+
+  const slug = slugifyLegislatorName(shortName) || `member-${Date.now()}`;
+  const baseId = `pol-${chamber === 'Senate' ? 's' : 'h'}-${slug}`;
+  const idCollision = db.prepare(`SELECT id FROM politicians WHERE id = ?`).get(baseId);
+  const id = idCollision ? `${baseId}-${Math.random().toString(36).slice(2, 6)}` : baseId;
+
+  db.prepare(
+    `INSERT OR IGNORE INTO politicians
+     (id, name, short_name, chamber, district, party, tenure_years, leadership_role, bio, total_raised, bills_authored, bills_passed)
+     VALUES (?, ?, ?, ?, '', '—', 0, ?, ?, 0, ?, ?)`
+  ).run(
+    id,
+    displayName,
+    shortName,
+    chamber,
+    input.session ? `Member (${input.session})` : '',
+    input.bio || `Texas ${chamber} legislator indexed from Texas Legislature Online (TLO).`,
+    input.billsAuthored ?? 0,
+    input.billsPassed ?? 0
+  );
+  return true;
+}
+
+export function backfillPoliticiansFromBills(): number {
+  const rows = db
+    .prepare(
+      `SELECT session, chamber, stage, primary_author, coauthors_json, sponsors_json, cosponsors_json
+       FROM bills`
+    )
+    .all() as Array<{
+    session: string;
+    chamber: 'House' | 'Senate';
+    stage: string;
+    primary_author: string;
+    coauthors_json: string;
+    sponsors_json: string;
+    cosponsors_json: string;
+  }>;
+
+  const stats = new Map<
+    string,
+    { shortName: string; chamber: 'House' | 'Senate'; authored: number; passed: number; latestSession: string }
+  >();
+
+  const bump = (rawName: string, ch: 'House' | 'Senate', isPrimary: boolean, isPassed: boolean, sess: string) => {
+    const clean = (rawName || '').replace(/\s+/g, ' ').trim();
+    if (!clean || /^(unassigned|et al\.?|committee|unknown)$/i.test(clean)) return;
+    const key = `${ch}::${clean.toLowerCase()}`;
+    const cur = stats.get(key) ?? {
+      shortName: clean,
+      chamber: ch,
+      authored: 0,
+      passed: 0,
+      latestSession: sess,
+    };
+    if (isPrimary) {
+      cur.authored++;
+      if (isPassed) cur.passed++;
+    }
+    if (sess > cur.latestSession) cur.latestSession = sess;
+    stats.set(key, cur);
+  };
+
+  for (const r of rows) {
+    const billChamber: 'House' | 'Senate' = r.chamber === 'Senate' ? 'Senate' : 'House';
+    const oppChamber: 'House' | 'Senate' = billChamber === 'House' ? 'Senate' : 'House';
+    const passed = r.stage === 'Signed' || r.stage === 'Enrolled';
+
+    bump(r.primary_author, billChamber, true, passed, r.session);
+    for (const ca of JSON.parse(r.coauthors_json || '[]') as string[]) {
+      bump(ca, billChamber, false, false, r.session);
+    }
+    for (const sp of JSON.parse(r.sponsors_json || '[]') as string[]) {
+      bump(sp, oppChamber, false, false, r.session);
+    }
+    for (const csp of JSON.parse(r.cosponsors_json || '[]') as string[]) {
+      bump(csp, oppChamber, false, false, r.session);
+    }
+  }
+
+  let created = 0;
+  const runTx = db.transaction(() => {
+    for (const entry of stats.values()) {
+      if (
+        upsertLegislatorRecord({
+          shortName: entry.shortName,
+          chamber: entry.chamber,
+          session: entry.latestSession,
+          billsAuthored: entry.authored,
+          billsPassed: entry.passed,
+        })
+      ) {
+        created++;
+      }
+    }
+  });
+  runTx();
+  return created;
+}
+

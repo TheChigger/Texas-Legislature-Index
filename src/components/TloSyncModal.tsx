@@ -26,6 +26,7 @@ export const TloSyncModal: React.FC<TloSyncModalProps> = ({
   const [concurrency, setConcurrency] = useState(4);
   const [includeBillText, setIncludeBillText] = useState(true);
   const [includeWitnesses, setIncludeWitnesses] = useState(true);
+  const [includeDocuments, setIncludeDocuments] = useState(true);
   const [skipUnchanged, setSkipUnchanged] = useState(true);
 
   const [activeJob, setActiveJob] = useState<TloSyncJob | null>(null);
@@ -141,6 +142,7 @@ export const TloSyncModal: React.FC<TloSyncModalProps> = ({
           startNumber: mode === 'batch' ? startNumber : 1,
           includeBillText,
           includeWitnesses,
+          includeDocuments,
           skipUnchanged,
           concurrency,
         }),
@@ -358,6 +360,19 @@ export const TloSyncModal: React.FC<TloSyncModalProps> = ({
                 <input
                   type="checkbox"
                   disabled={isJobRunning}
+                  checked={includeDocuments}
+                  onChange={(e) => setIncludeDocuments(e.target.checked)}
+                  className="w-4 h-4 accent-[#9A3412] mt-0.5 shrink-0"
+                />
+                <span>
+                  Download HRO/SRC bill analyses &amp; LBB fiscal notes (for timeline context)
+                </span>
+              </label>
+
+              <label className="flex items-start gap-2.5 text-xs text-[#181715] cursor-pointer">
+                <input
+                  type="checkbox"
+                  disabled={isJobRunning}
                   checked={skipUnchanged}
                   onChange={(e) => setSkipUnchanged(e.target.checked)}
                   className="w-4 h-4 accent-[#9A3412] mt-0.5 shrink-0"
@@ -439,7 +454,7 @@ export const TloSyncModal: React.FC<TloSyncModalProps> = ({
                 </div>
               )}
 
-              <div className="grid grid-cols-3 sm:grid-cols-6 gap-2 text-[11px] font-mono tabular-nums text-[#57534E]">
+              <div className="grid grid-cols-4 sm:grid-cols-7 gap-2 text-[11px] font-mono tabular-nums text-[#57534E]">
                 <div>
                   <span className="block text-[10px] uppercase">Synced</span>
                   <span className="text-[#181715] font-semibold">
@@ -456,6 +471,12 @@ export const TloSyncModal: React.FC<TloSyncModalProps> = ({
                   <span className="block text-[10px] uppercase">Versions</span>
                   <span className="text-[#181715] font-semibold">
                     {activeJob.amendmentsIngested.toLocaleString()}
+                  </span>
+                </div>
+                <div>
+                  <span className="block text-[10px] uppercase">Docs</span>
+                  <span className="text-[#181715] font-semibold">
+                    {(activeJob.documentsIngested ?? 0).toLocaleString()}
                   </span>
                 </div>
                 <div>

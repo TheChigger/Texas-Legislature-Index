@@ -880,6 +880,27 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
                       </pre>
                     </div>
 
+                    {detail.documents && detail.documents.length > 0 && (
+                      <div className="border-t border-[#DFD9CE] pt-4 space-y-2.5">
+                        <h3 className="text-xs font-condensed uppercase tracking-wider text-[#57534E]">
+                          Bill Analyses &amp; LBB Fiscal Notes ({detail.documents.length})
+                        </h3>
+                        <div className="divide-y divide-[#DFD9CE] border border-[#DFD9CE] bg-[#FBF9F5]">
+                          {detail.documents.map((doc) => (
+                            <div key={doc.id} className="p-3 space-y-1">
+                              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                                <span className="font-medium text-[#181715]">{doc.title}</span>
+                                <span className="font-mono text-[11px] text-[#78716C]">
+                                  {doc.docType === 'analysis' ? 'Analysis' : 'Fiscal Note'} · {doc.versionLabel}
+                                </span>
+                              </div>
+                              <p className="text-xs text-[#57534E] leading-relaxed">{doc.summary}</p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
                     {/* Committees & Co-Authors */}
                     <div className="border-t border-[#DFD9CE] pt-4 grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
                       <div>

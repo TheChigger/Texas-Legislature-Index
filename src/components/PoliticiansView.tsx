@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Search, Share2, FileSpreadsheet } from 'lucide-react';
+import { Search, Share2, FileSpreadsheet, RefreshCw } from 'lucide-react';
 import type { PoliticianDetail, PoliticianSummary } from '../types.ts';
 import { csvDateStamp, downloadCsv } from '../utils/csv.ts';
 
@@ -8,6 +8,8 @@ interface PoliticiansViewProps {
   onSelectPolitician: (id: string) => void;
   onOpenBill: (billId: string) => void;
   onInspectInNetwork: (polId: string) => void;
+  activeSession?: string;
+  onDataMutated?: () => void;
 }
 
 export const PoliticiansView: React.FC<PoliticiansViewProps> = ({
@@ -15,6 +17,8 @@ export const PoliticiansView: React.FC<PoliticiansViewProps> = ({
   onSelectPolitician,
   onOpenBill,
   onInspectInNetwork,
+  activeSession,
+  onDataMutated,
 }) => {
   const [query, setQuery] = useState('');
   const [chamber, setChamber] = useState('');
@@ -23,6 +27,16 @@ export const PoliticiansView: React.FC<PoliticiansViewProps> = ({
   const [detail, setDetail] = useState<PoliticianDetail | null>(null);
   const [tab, setTab] = useState<'votes' | 'sponsorships' | 'committees' | 'donors' | 'outreach'>('donors');
   const [loading, setLoading] = useState(false);
+  const [syncSession, setSyncSession] = useState(activeSession || '89R');
+  const [syncingRoster, setSyncingRoster] = useState(false);
+  const [syncNotice, setSyncNotice] = useState<{ error?: boolean; text: string } | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
+
+  useEffect(() => {
+    if (activeSession) {
+      setSyncSession(activeSession);
+    }
+  }, [activeSession]);
 
   useEffect(() => {
     const params = new URLSearchParams();
@@ -40,7 +54,33 @@ export const PoliticiansView: React.FC<PoliticiansViewProps> = ({
         }
       })
       .catch(() => {});
-  }, [query, chamber, party]);
+  }, [query, chamber, party, reloadTick]);
+
+  const handleSyncTloRoster = async () => {
+    setSyncingRoster(true);
+    setSyncNotice(null);
+    try {
+      const res = await fetch('/api/politicians/sync-tlo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session: syncSession, fetchProfiles: true, concurrency: 4 }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setSyncNotice({ error: true, text: data.error || 'Failed to sync TLO roster.' });
+      } else {
+        setSyncNotice({
+          text: `Synced ${data.totalFound} ${data.session} legislators (${data.houseCount} House, ${data.senateCount} Senate; ${data.createdCount} added).`,
+        });
+        setReloadTick((t) => t + 1);
+        onDataMutated?.();
+      }
+    } catch {
+      setSyncNotice({ error: true, text: 'Network error contacting TLO FTP server.' });
+    } finally {
+      setSyncingRoster(false);
+    }
+  };
 
   useEffect(() => {
     if (!selectedPoliticianId) return;
@@ -159,6 +199,31 @@ export const PoliticiansView: React.FC<PoliticiansViewProps> = ({
               </button>
             ))}
           </div>
+          <div className="inline-flex border border-[#C5BDB0] bg-[#FFFFFF] rounded overflow-hidden">
+            <select
+              value={syncSession}
+              onChange={(e) => setSyncSession(e.target.value)}
+              disabled={syncingRoster}
+              aria-label="Session for TLO legislator roster sync"
+              className="px-2 py-1.5 text-xs font-mono bg-[#FFFFFF] text-[#181715] border-r border-[#C5BDB0] focus:outline-none"
+            >
+              {['90R', '89R', '88R', '87R', '86R', '85R'].map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={handleSyncTloRoster}
+              disabled={syncingRoster}
+              className="px-3 py-1.5 text-xs font-medium bg-[#181715] text-[#FBF9F5] hover:bg-[#9A3412] disabled:opacity-60 inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+              title="Import all House and Senate legislators for this session from TLO FTP"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${syncingRoster ? 'animate-spin' : ''}`} />
+              {syncingRoster ? 'Syncing TLO Roster…' : 'Sync TLO Roster'}
+            </button>
+          </div>
           <button
             type="button"
             onClick={handleExportPoliticiansCsv}
@@ -171,6 +236,18 @@ export const PoliticiansView: React.FC<PoliticiansViewProps> = ({
           </button>
         </div>
       </div>
+
+      {syncNotice && (
+        <div
+          className={`px-4 py-2.5 border text-xs ${
+            syncNotice.error
+              ? 'bg-[#FEF2F2] border-[#FECACA] text-[#7F1D1D]'
+              : 'bg-[#F0FDF4] border-[#BBF7D0] text-[#14532D]'
+          }`}
+        >
+          {syncNotice.text}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         {/* Left Roster */}
@@ -192,10 +269,14 @@ export const PoliticiansView: React.FC<PoliticiansViewProps> = ({
                 >
                   <div className="flex items-center justify-between gap-2 text-xs font-mono text-[#57534E]">
                     <span>
-                      {p.party} · {p.chamber} · {p.district}
+                      {p.party !== '—' ? `${p.party} · ` : ''}
+                      {p.chamber}
+                      {p.district ? ` · ${p.district}` : ''}
                     </span>
                     <span className="tabular-nums text-[#181715] font-medium">
-                      ${(p.totalRaised / 1000000).toFixed(2)}M
+                      {p.totalRaised > 0
+                        ? `$${(p.totalRaised / 1000000).toFixed(2)}M`
+                        : `${p.billsAuthored} bills`}
                     </span>
                   </div>
                   <div className="font-display text-sm font-bold text-[#181715] mt-1">
@@ -224,8 +305,14 @@ export const PoliticiansView: React.FC<PoliticiansViewProps> = ({
               <div className="p-6 border-b border-[#DFD9CE] bg-[#FBF9F5]">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="text-xs font-mono text-[#57534E]">
-                    {detail.party === 'R' ? 'Republican' : 'Democratic'} · Texas {detail.chamber} ·{' '}
-                    {detail.district} · {detail.tenureYears} yrs tenure
+                    {detail.party === 'R'
+                      ? 'Republican'
+                      : detail.party === 'D'
+                        ? 'Democratic'
+                        : 'TLO Roster'}{' '}
+                    · Texas {detail.chamber}
+                    {detail.district ? ` · ${detail.district}` : ''}
+                    {detail.tenureYears > 0 ? ` · ${detail.tenureYears} yrs tenure` : ''}
                   </div>
                   <button
                     type="button"
@@ -251,7 +338,7 @@ export const PoliticiansView: React.FC<PoliticiansViewProps> = ({
                   <div className="p-3 bg-[#FFFFFF] border border-[#DFD9CE]">
                     <div className="text-[#78716C]">Career / Cycle Raised</div>
                     <div className="text-base font-semibold text-[#181715] mt-0.5">
-                      ${detail.totalRaised.toLocaleString()}
+                      {detail.totalRaised > 0 ? `$${detail.totalRaised.toLocaleString()}` : 'Not Indexed'}
                     </div>
                   </div>
                   <div className="p-3 bg-[#FFFFFF] border border-[#DFD9CE]">
