@@ -3,7 +3,7 @@ import http from 'http';
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
-import { db, initSchema } from './src/server/db.ts';
+import { db, DB_PATH, dbExistedBeforeOpen, initSchema } from './src/server/db.ts';
 import { seedDatabaseIfEmpty } from './src/server/seed.ts';
 import { apiRouter } from './src/server/routes.ts';
 import { cancelTloSyncJob, getLatestRunningTloSyncJob } from './src/server/tloFtp.ts';
@@ -14,7 +14,16 @@ async function startServer() {
 
   const app = express();
   const httpServer = http.createServer(app);
-  const PORT = 3000;
+  const isAiStudioDevSandbox = Boolean(process.env.K_SERVICE && process.env.NODE_ENV !== 'production');
+  const PORT = isAiStudioDevSandbox
+    ? 3000
+    : Number(process.env.CAPITOL_PORT || process.env.PORT || 3089);
+
+  if (dbExistedBeforeOpen) {
+    console.log(`Using existing SQLite database at ${DB_PATH}`);
+  } else {
+    console.log(`Initialized SQLite database at ${DB_PATH}`);
+  }
 
   app.use(express.json({ limit: '2mb' }));
   app.use('/api', apiRouter);

@@ -11,6 +11,7 @@ import {
   syncBillFts,
   upsertLegislatorRecord,
 } from './db.ts';
+import { decodeHtmlEntities, htmlToCleanPlainText } from './textClean.ts';
 import type { BillStage, Chamber } from '../types.ts';
 
 export type TloBillType =
@@ -210,26 +211,13 @@ function formatSessionMetadata(code: string): TloSessionInfo {
 }
 
 function decodeXmlEntities(str: string): string {
-  return str
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&apos;/gi, "'")
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&aacute;/gi, 'á')
-    .replace(/&eacute;/gi, 'é')
-    .replace(/&iacute;/gi, 'í')
-    .replace(/&oacute;/gi, 'ó')
-    .replace(/&uacute;/gi, 'ú')
-    .replace(/&ntilde;/gi, 'ñ')
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+  return decodeHtmlEntities(str);
 }
 
 function extractTag(xml: string, tag: string): string {
   const regex = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, 'i');
   const m = xml.match(regex);
-  return m ? decodeXmlEntities(m[1].trim()) : '';
+  return m ? decodeHtmlEntities(m[1].trim()) : '';
 }
 
 function extractAllTags(xml: string, tag: string): string[] {
@@ -237,22 +225,13 @@ function extractAllTags(xml: string, tag: string): string[] {
   const results: string[] = [];
   let m: RegExpExecArray | null;
   while ((m = regex.exec(xml)) !== null) {
-    results.push(decodeXmlEntities(m[1].trim()));
+    results.push(decodeHtmlEntities(m[1].trim()));
   }
   return results;
 }
 
 function htmlToPlainText(html: string): string {
-  return decodeXmlEntities(
-    html
-      .replace(/<style[\s\S]*?<\/style>/gi, '')
-      .replace(/<script[\s\S]*?<\/script>/gi, '')
-      .replace(/<(?:p|div|tr|li|br|h[1-6])[^>]*>/gi, '\n')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/[ \t]+/g, ' ')
-      .replace(/\n\s*\n+/g, '\n')
-      .trim()
-  );
+  return htmlToCleanPlainText(html);
 }
 
 function inferStageFromTlo(lastAction: string, committees: Array<{ status: string }>): BillStage {

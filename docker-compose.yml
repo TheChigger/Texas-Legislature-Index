@@ -1,0 +1,15 @@
+services:
+  capitol-ledger:
+    build: .
+    container_name: texas-capitol-ledger
+    restart: unless-stopped
+    ports:
+      - "3089:3089"
+    environment:
+      NODE_ENV: production
+      CAPITOL_PORT: 3089
+      CAPITOL_DB_PATH: /app/data/capitol_ledger.db
+      SKIP_SEED_ON_EXISTING_DB: "true"
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    volumes:
+      - ./data:/app/data

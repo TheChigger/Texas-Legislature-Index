@@ -1,14 +1,27 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
+import { sanitizeStoredPlainText } from './textClean.ts';
 import type { InfluenceBreakdown } from '../types.ts';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+const configuredDbPath = (process.env.CAPITOL_DB_PATH || '').trim();
+const configuredDataDir = (process.env.CAPITOL_DATA_DIR || '').trim();
+
+export const DATA_DIR = configuredDbPath
+  ? path.dirname(path.resolve(configuredDbPath))
+  : configuredDataDir
+    ? path.resolve(configuredDataDir)
+    : path.resolve(process.cwd(), 'data');
+
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-const DB_PATH = path.join(DATA_DIR, 'capitol_ledger.db');
+export const DB_PATH = configuredDbPath
+  ? path.resolve(configuredDbPath)
+  : path.join(DATA_DIR, 'capitol_ledger.db');
+
+export const dbExistedBeforeOpen = fs.existsSync(DB_PATH);
 export const db = new Database(DB_PATH);
 
 db.pragma('journal_mode = WAL');
@@ -316,6 +329,8 @@ export function initSchema(): void {
 
     CREATE INDEX IF NOT EXISTS idx_bill_docs_bill ON bill_documents(bill_id);
   `);
+
+  cleanExistingIndexedHtml();
 }
 
 export function normalizeIsoDate(raw: string): string {
@@ -846,4 +861,125 @@ export function backfillPoliticiansFromBills(): number {
   runTx();
   return created;
 }
+
+const ENTITY_OR_TAG_WHERE = `(
+  full_text LIKE '%&#%'
+  OR full_text LIKE '%&nbsp;%'
+  OR full_text LIKE '%&mdash;%'
+  OR full_text LIKE '%&ndash;%'
+  OR full_text LIKE '%&rsquo;%'
+  OR full_text LIKE '%&lsquo;%'
+  OR full_text LIKE '%&ldquo;%'
+  OR full_text LIKE '%&rdquo;%'
+  OR full_text LIKE '%&sect;%'
+  OR full_text LIKE '%&hellip;%'
+  OR full_text LIKE '%&lt;%'
+  OR full_text LIKE '%&gt;%'
+  OR full_text LIKE '%&quot;%'
+  OR full_text LIKE '%</%'
+  OR full_text LIKE '%<p>%'
+  OR full_text LIKE '%<p %'
+  OR full_text LIKE '%<br%'
+  OR full_text LIKE '%<div%'
+  OR full_text LIKE '%<span%'
+  OR full_text LIKE '%<table%'
+  OR full_text LIKE '%<tr%'
+  OR full_text LIKE '%<td%'
+  OR full_text LIKE '%<style%'
+)`;
+
+export function cleanExistingIndexedHtml(): number {
+  let cleanedCount = 0;
+
+  const billRows = db
+    .prepare(`SELECT id, title, summary, full_text FROM bills WHERE ${ENTITY_OR_TAG_WHERE}`)
+    .all() as Array<{ id: string; title: string; summary: string; full_text: string }>;
+
+  const amendRows = db
+    .prepare(`SELECT id, summary, full_text FROM amendments WHERE ${ENTITY_OR_TAG_WHERE}`)
+    .all() as Array<{ id: string; summary: string; full_text: string }>;
+
+  const docRows = db
+    .prepare(`SELECT id, title, summary, full_text FROM bill_documents WHERE ${ENTITY_OR_TAG_WHERE}`)
+    .all() as Array<{ id: string; title: string; summary: string; full_text: string }>;
+
+  const statRows = db
+    .prepare(`SELECT id, full_text, acts_history FROM statute_sections WHERE ${ENTITY_OR_TAG_WHERE}`)
+    .all() as Array<{ id: string; full_text: string; acts_history: string }>;
+
+  const snapRows = db
+    .prepare(`SELECT id, full_text, acts_history FROM statute_snapshots WHERE ${ENTITY_OR_TAG_WHERE}`)
+    .all() as Array<{ id: string; full_text: string; acts_history: string }>;
+
+  if (
+    billRows.length === 0 &&
+    amendRows.length === 0 &&
+    docRows.length === 0 &&
+    statRows.length === 0 &&
+    snapRows.length === 0
+  ) {
+    return 0;
+  }
+
+  const updBill = db.prepare(`UPDATE bills SET title = ?, summary = ?, full_text = ? WHERE id = ?`);
+  const updAmend = db.prepare(`UPDATE amendments SET summary = ?, full_text = ? WHERE id = ?`);
+  const updDoc = db.prepare(`UPDATE bill_documents SET title = ?, summary = ?, full_text = ? WHERE id = ?`);
+  const updStat = db.prepare(`UPDATE statute_sections SET full_text = ?, acts_history = ? WHERE id = ?`);
+  const updSnap = db.prepare(`UPDATE statute_snapshots SET full_text = ?, acts_history = ? WHERE id = ?`);
+
+  const runTx = db.transaction(() => {
+    for (const r of billRows) {
+      const nextTitle = sanitizeStoredPlainText(r.title);
+      const nextSummary = sanitizeStoredPlainText(r.summary);
+      const nextFull = sanitizeStoredPlainText(r.full_text);
+      if (nextTitle !== r.title || nextSummary !== r.summary || nextFull !== r.full_text) {
+        updBill.run(nextTitle, nextSummary, nextFull, r.id);
+        syncBillFts(r.id);
+        cleanedCount++;
+      }
+    }
+
+    for (const r of amendRows) {
+      const nextSummary = sanitizeStoredPlainText(r.summary);
+      const nextFull = sanitizeStoredPlainText(r.full_text);
+      if (nextSummary !== r.summary || nextFull !== r.full_text) {
+        updAmend.run(nextSummary, nextFull, r.id);
+        syncAmendmentFts(r.id);
+        cleanedCount++;
+      }
+    }
+
+    for (const r of docRows) {
+      const nextTitle = sanitizeStoredPlainText(r.title);
+      const nextSummary = sanitizeStoredPlainText(r.summary);
+      const nextFull = sanitizeStoredPlainText(r.full_text);
+      if (nextTitle !== r.title || nextSummary !== r.summary || nextFull !== r.full_text) {
+        updDoc.run(nextTitle, nextSummary, nextFull, r.id);
+        cleanedCount++;
+      }
+    }
+
+    for (const r of statRows) {
+      const nextFull = sanitizeStoredPlainText(r.full_text);
+      const nextActs = sanitizeStoredPlainText(r.acts_history);
+      if (nextFull !== r.full_text || nextActs !== r.acts_history) {
+        updStat.run(nextFull, nextActs, r.id);
+        cleanedCount++;
+      }
+    }
+
+    for (const r of snapRows) {
+      const nextFull = sanitizeStoredPlainText(r.full_text);
+      const nextActs = sanitizeStoredPlainText(r.acts_history);
+      if (nextFull !== r.full_text || nextActs !== r.acts_history) {
+        updSnap.run(nextFull, nextActs, r.id);
+        cleanedCount++;
+      }
+    }
+  });
+
+  runTx();
+  return cleanedCount;
+}
+
 

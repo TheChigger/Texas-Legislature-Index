@@ -2,6 +2,7 @@ import * as ftp from 'basic-ftp';
 import { Writable } from 'stream';
 import zlib from 'zlib';
 import { db } from './db.ts';
+import { htmlToCleanPlainText } from './textClean.ts';
 
 export interface TexasCodeCatalogEntry {
   code: string;
@@ -105,19 +106,7 @@ function extractZipHtmlEntries(zipBuffer: Buffer): Array<{ fileName: string; con
 }
 
 function stripStatuteHtml(html: string): string {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/&#xa0;|&nbsp;/gi, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/<(?:p|div|tr|li|br|h[1-6])[^>]*>/gi, '\n')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/[ \t]+/g, ' ')
-    .replace(/\n\s*\n+/g, '\n')
-    .trim();
+  return htmlToCleanPlainText(html);
 }
 
 export function extractActsSessions(actsText: string): string[] {

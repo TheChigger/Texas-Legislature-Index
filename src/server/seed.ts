@@ -1,6 +1,7 @@
 import {
   backfillPoliticiansFromBills,
   db,
+  dbExistedBeforeOpen,
   evaluateAlertRules,
   recomputeBillMetrics,
   refreshSessionCounts,
@@ -10,8 +11,24 @@ import {
 import { TEXAS_CODE_CATALOG, extractActsSessions } from './statutes.ts';
 
 export function seedDatabaseIfEmpty(): void {
-  const existing = db.prepare(`SELECT COUNT(*) AS c FROM bills`).get() as { c: number };
-  if (existing.c > 0) {
+  const billCount = (db.prepare(`SELECT COUNT(*) AS c FROM bills`).get() as { c: number }).c;
+  const polCount = (db.prepare(`SELECT COUNT(*) AS c FROM politicians`).get() as { c: number }).c;
+  const statCount = (db.prepare(`SELECT COUNT(*) AS c FROM statute_sections`).get() as { c: number }).c;
+  const hasExistingData = billCount > 0 || polCount > 0 || statCount > 0;
+
+  if (dbExistedBeforeOpen && hasExistingData) {
+    if (process.env.SKIP_SEED_ON_EXISTING_DB === 'true') {
+      backfillPoliticiansFromBills();
+      return;
+    }
+    seedPublicSentimentIfEmpty();
+    seedStatutesIfEmpty();
+    seedBillDocumentsIfEmpty();
+    backfillPoliticiansFromBills();
+    return;
+  }
+
+  if (hasExistingData) {
     seedPublicSentimentIfEmpty();
     seedStatutesIfEmpty();
     seedBillDocumentsIfEmpty();
