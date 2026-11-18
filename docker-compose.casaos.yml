@@ -1,0 +1,29 @@
+name: texas-capitol-ledger
+services:
+  texas-capitol-ledger:
+    image: ghcr.io/YOUR_GITHUB_USER/YOUR_REPO_NAME:latest
+    container_name: texas-capitol-ledger
+    restart: unless-stopped
+    ports:
+      - target: 3089
+        published: "3089"
+        protocol: tcp
+    environment:
+      NODE_ENV: production
+      CAPITOL_PORT: "3089"
+      CAPITOL_DB_PATH: /app/data/capitol_ledger.db
+      SKIP_SEED_ON_EXISTING_DB: "true"
+      GEMINI_API_KEY: ""
+    volumes:
+      - type: bind
+        source: /DATA/AppData/texas-capitol-ledger/data
+        target: /app/data
+x-casaos:
+  architectures:
+    - amd64
+  main: texas-capitol-ledger
+  port_map: "3089"
+  title:
+    en_us: Texas Capitol Ledger
+  tagline:
+    en_us: Texas Legislative & Statutory Research Workstation
