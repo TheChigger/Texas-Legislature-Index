@@ -10,6 +10,7 @@ import { StatutesView } from './components/StatutesView.tsx';
 import { TloSyncModal } from './components/TloSyncModal.tsx';
 import { NewBillModal } from './components/NewBillModal.tsx';
 import { NewAlertModal } from './components/NewAlertModal.tsx';
+import { ShortcutsModal } from './components/ShortcutsModal.tsx';
 import type { OverviewResponse, PoliticianSummary } from './types.ts';
 
 export default function App() {
@@ -24,8 +25,116 @@ export default function App() {
   const [showTloModal, setShowTloModal] = useState(false);
   const [showNewBillModal, setShowNewBillModal] = useState(false);
   const [showNewAlertModal, setShowNewAlertModal] = useState(false);
+  const [showShortcutsModal, setShowShortcutsModal] = useState(false);
 
   const triggerRefresh = () => setRefreshSignal((n) => n + 1);
+
+  useEffect(() => {
+    const VIEW_KEYS: Record<string, ActiveView> = {
+      '1': 'legislation',
+      '2': 'politicians',
+      '3': 'receptivity',
+      '4': 'network',
+      '5': 'amendments',
+      '6': 'statutes',
+      '7': 'alerts',
+    };
+
+    const focusPrimarySearch = () => {
+      const tryFocus = () => {
+        const el = document.querySelector<HTMLInputElement>('[data-global-search="true"]');
+        if (el) {
+          el.focus();
+          el.select();
+          return true;
+        }
+        return false;
+      };
+      if (!tryFocus()) {
+        setActiveView('legislation');
+        window.requestAnimationFrame(() => {
+          window.setTimeout(tryFocus, 30);
+        });
+      }
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const isEditing =
+        target !== null &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable);
+
+      const anyModalOpen =
+        showTloModal || showNewBillModal || showNewAlertModal || showShortcutsModal;
+
+      if (e.key === 'Escape') {
+        if (anyModalOpen) {
+          e.preventDefault();
+          setShowShortcutsModal(false);
+          setShowTloModal(false);
+          setShowNewBillModal(false);
+          setShowNewAlertModal(false);
+          return;
+        }
+        if (isEditing && target) {
+          target.blur();
+        }
+        return;
+      }
+
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        if (!anyModalOpen) focusPrimarySearch();
+        return;
+      }
+
+      if (isEditing || e.metaKey || e.ctrlKey || e.altKey) return;
+
+      if (e.key === '?' || (e.key === '/' && e.shiftKey)) {
+        e.preventDefault();
+        setShowShortcutsModal((prev) => !prev);
+        return;
+      }
+
+      if (anyModalOpen) return;
+
+      if (e.key === '/') {
+        e.preventDefault();
+        focusPrimarySearch();
+        return;
+      }
+
+      const lower = e.key.toLowerCase();
+      if (lower === 'n') {
+        e.preventDefault();
+        setShowNewBillModal(true);
+      } else if (lower === 'a') {
+        e.preventDefault();
+        setShowNewAlertModal(true);
+      } else if (lower === 't') {
+        e.preventDefault();
+        setShowTloModal(true);
+      } else if (lower === 'e') {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent('capitol:export-csv'));
+      } else if (lower === 'j') {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent('capitol:step-item', { detail: { delta: 1 } }));
+      } else if (lower === 'k') {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent('capitol:step-item', { detail: { delta: -1 } }));
+      } else if (VIEW_KEYS[e.key]) {
+        e.preventDefault();
+        setActiveView(VIEW_KEYS[e.key]);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [showTloModal, showNewBillModal, showNewAlertModal, showShortcutsModal]);
 
   useEffect(() => {
     const params = new URLSearchParams();
@@ -200,15 +309,32 @@ export default function App() {
           <span>
             Texas Capitol Ledger · Deterministic SQLite FTS5 Keyword Index & TLO FTP Archive (ftp://ftp.legis.state.tx.us)
           </span>
-          <button
-            type="button"
-            onClick={() => setShowTloModal(true)}
-            className="text-[#9A3412] hover:underline font-medium cursor-pointer"
-          >
-            Sync Historical Sessions (71R–90R)
-          </button>
+          <div className="flex items-center gap-4">
+            <button
+              type="button"
+              onClick={() => setShowShortcutsModal(true)}
+              className="text-[#57534E] hover:text-[#181715] inline-flex items-center gap-1.5 cursor-pointer"
+            >
+              <span>Shortcuts</span>
+              <kbd className="px-1.5 py-0.5 font-mono text-[10px] bg-[#FFFFFF] border border-[#C5BDB0] rounded text-[#181715]">
+                ?
+              </kbd>
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowTloModal(true)}
+              className="text-[#9A3412] hover:underline font-medium cursor-pointer"
+            >
+              Sync Historical Sessions (71R–90R)
+            </button>
+          </div>
         </div>
       </footer>
+
+      <ShortcutsModal
+        isOpen={showShortcutsModal}
+        onClose={() => setShowShortcutsModal(false)}
+      />
 
       <TloSyncModal
         isOpen={showTloModal}

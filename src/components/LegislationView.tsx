@@ -11,6 +11,7 @@ import {
   ChevronDown,
   ChevronUp,
   Sparkles,
+  FileSpreadsheet,
 } from 'lucide-react';
 import type {
   BillDetail,
@@ -19,6 +20,7 @@ import type {
   OverviewResponse,
 } from '../types.ts';
 import { RedlineDiffPane } from './RedlineDiffPane.tsx';
+import { csvDateStamp, downloadCsv } from '../utils/csv.ts';
 
 interface LegislationViewProps {
   overview: OverviewResponse | null;
@@ -228,6 +230,137 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
     }
   };
 
+  const [exportingCsv, setExportingCsv] = useState(false);
+
+  const handleExportBillsCsv = async () => {
+    setExportingCsv(true);
+    try {
+      let rowsToExport = bills;
+      if (bills.length >= 100) {
+        const params = new URLSearchParams();
+        if (query.trim()) params.set('q', query.trim());
+        if (activeSession) params.set('session', activeSession);
+        if (chamber) params.set('chamber', chamber);
+        if (stage) params.set('stage', stage);
+        params.set('sort', query.trim() && sort === 'influence' ? 'relevance' : sort);
+        params.set('limit', '10000');
+        const res = await fetch(`/api/bills?${params.toString()}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data.bills)) rowsToExport = data.bills;
+        }
+      }
+
+      downloadCsv(
+        `texas-bills-${activeSession || 'all'}-${csvDateStamp()}.csv`,
+        [
+          'Session',
+          'Bill Number',
+          'Chamber',
+          'Stage',
+          'Title',
+          'Primary Author',
+          'Co-Authors',
+          'Sponsors',
+          'Committees',
+          'Subjects',
+          'Statute Codes',
+          'Influence Score',
+          'Momentum',
+          'Versions',
+          'Actions',
+          'Links',
+          'Filed Date',
+          'Last Action Date',
+          'Last Action',
+          'Source',
+        ],
+        rowsToExport.map((b) => [
+          b.session,
+          b.billNumber,
+          b.chamber,
+          b.stage,
+          b.title,
+          b.primaryAuthor,
+          b.coauthors,
+          b.sponsors,
+          b.committees.map((c) => `${c.chamber} ${c.name} (${c.status})`),
+          b.subjects,
+          b.statuteCodes,
+          b.influenceScore.toFixed(1),
+          b.momentumLabel,
+          b.amendmentCount,
+          b.actionCount,
+          b.linkCount,
+          b.filedDate,
+          b.lastActionDate,
+          b.lastAction,
+          b.source,
+        ])
+      );
+    } finally {
+      setExportingCsv(false);
+    }
+  };
+
+  const handleExportDossierCsv = () => {
+    if (!detail) return;
+    const rows: Array<Array<unknown>> = [
+      ...detail.actions.map((a) => [
+        'Action',
+        a.actionDate,
+        a.actionNumber,
+        a.description,
+        '',
+        '',
+      ]),
+      ...detail.amendments.map((am) => [
+        'Version / Amendment',
+        am.filedDate,
+        am.amendmentNumber,
+        `${am.versionLabel} (${am.disposition})`,
+        am.sponsor,
+        `${am.yeaVotes}-${am.nayVotes}`,
+      ]),
+      ...detail.witnesses.map((w) => [
+        'Committee Witness',
+        w.hearingDate,
+        w.position,
+        `${w.witnessName} (${w.affiliation})`,
+        w.committeeName,
+        w.testified ? 'Testified' : 'Registered',
+      ]),
+    ];
+
+    downloadCsv(
+      `dossier-${detail.session}-${detail.billNumber.replace(/\s+/g, '')}-${csvDateStamp()}.csv`,
+      ['Record Type', 'Date', 'Code / Position', 'Detail', 'Actor / Committee', 'Outcome / Notes'],
+      rows
+    );
+  };
+
+  useEffect(() => {
+    const onExport = () => {
+      void handleExportBillsCsv();
+    };
+    const onStep = (ev: Event) => {
+      const delta = (ev as CustomEvent<{ delta?: number }>).detail?.delta ?? 1;
+      if (bills.length === 0) return;
+      const curIdx = bills.findIndex((b) => b.id === selectedBillId);
+      const nextIdx =
+        curIdx === -1
+          ? 0
+          : Math.max(0, Math.min(bills.length - 1, curIdx + delta));
+      if (bills[nextIdx]) onSelectBill(bills[nextIdx].id);
+    };
+    window.addEventListener('capitol:export-csv', onExport);
+    window.addEventListener('capitol:step-item', onStep);
+    return () => {
+      window.removeEventListener('capitol:export-csv', onExport);
+      window.removeEventListener('capitol:step-item', onStep);
+    };
+  }, [bills, selectedBillId, detail, query, activeSession, chamber, stage, sort]);
+
   return (
     <div className="space-y-6">
       {/* Section 1: Influential Legislation & Multi-Session Keyword Trends */}
@@ -361,12 +494,13 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
             <Search className="w-4 h-4 text-[#57534E] absolute left-3 top-1/2 -translate-y-1/2" />
             <input
               type="text"
+              data-global-search="true"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder='Search Texas bills, statutory text & subjects (supports AND, OR, NOT, "exact phrase", prefix*)'
               className="w-full pl-9 pr-20 py-2.5 bg-[#FFFFFF] border border-[#C5BDB0] text-sm text-[#181715] rounded focus:outline-none focus:border-[#9A3412]"
             />
-            {query && (
+            {query ? (
               <button
                 type="button"
                 onClick={() => setQuery('')}
@@ -374,14 +508,29 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
               >
                 Clear
               </button>
+            ) : (
+              <kbd className="hidden sm:inline-block absolute right-3 top-1/2 -translate-y-1/2 px-1.5 py-0.5 text-[10px] font-mono text-[#78716C] bg-[#FBF9F5] border border-[#DFD9CE] rounded pointer-events-none">
+                /
+              </kbd>
             )}
           </div>
 
           <div className="flex flex-wrap items-center gap-2 shrink-0">
             <button
               type="button"
+              onClick={handleExportBillsCsv}
+              disabled={exportingCsv || bills.length === 0}
+              className="px-3.5 py-2.5 text-xs font-medium bg-[#FFFFFF] border border-[#C5BDB0] text-[#181715] rounded hover:border-[#181715] disabled:opacity-50 inline-flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+              title="Export matching bills to CSV (Shortcut: e)"
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5 text-[#14532D]" />
+              {exportingCsv ? 'Exporting...' : 'Export CSV'}
+            </button>
+            <button
+              type="button"
               onClick={onOpenTloSync}
               className="px-3.5 py-2.5 text-xs font-medium bg-[#FFFFFF] border border-[#C5BDB0] text-[#181715] rounded hover:border-[#181715] inline-flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+              title="Sync TLO FTP Archive (Shortcut: t)"
             >
               <Download className="w-3.5 h-3.5 text-[#9A3412]" />
               Sync TLO FTP
@@ -390,6 +539,7 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
               type="button"
               onClick={onOpenNewBill}
               className="px-3.5 py-2.5 text-xs font-medium bg-[#181715] text-[#FBF9F5] rounded hover:bg-[#292524] inline-flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+              title="Index New Bill (Shortcut: n)"
             >
               <FilePlus2 className="w-3.5 h-3.5" />
               Index Bill
@@ -569,14 +719,24 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
                     <span aria-hidden="true">·</span>
                     <span className="tabular-nums">Influence {detail.influenceScore.toFixed(1)}</span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => onInspectInNetwork(detail.id)}
-                    className="inline-flex items-center gap-1.5 text-xs font-sans font-medium text-[#1E3A5F] hover:text-[#9A3412] cursor-pointer whitespace-nowrap"
-                  >
-                    <Share2 className="w-3.5 h-3.5" />
-                    Map in Network
-                  </button>
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={handleExportDossierCsv}
+                      className="inline-flex items-center gap-1.5 text-xs font-sans font-medium text-[#14532D] hover:underline cursor-pointer whitespace-nowrap"
+                    >
+                      <FileSpreadsheet className="w-3.5 h-3.5" />
+                      Dossier CSV
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onInspectInNetwork(detail.id)}
+                      className="inline-flex items-center gap-1.5 text-xs font-sans font-medium text-[#1E3A5F] hover:text-[#9A3412] cursor-pointer whitespace-nowrap"
+                    >
+                      <Share2 className="w-3.5 h-3.5" />
+                      Map in Network
+                    </button>
+                  </div>
                 </div>
 
                 <h2 className="font-display text-2xl font-bold text-[#181715] mt-2 leading-tight">

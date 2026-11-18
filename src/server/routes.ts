@@ -10,7 +10,15 @@ import {
   syncBillFts,
 } from './db.ts';
 import { computeLineDiff } from './diff.ts';
-import { listTloFtpSessions, syncFromTloFtp } from './tloFtp.ts';
+import {
+  cancelTloSyncJob,
+  getLatestTloSyncJob,
+  getTloSyncJob,
+  listTloFtpSessions,
+  startTloSyncJob,
+  syncFromTloFtp,
+  type TloBillType,
+} from './tloFtp.ts';
 import { fetchStatuteSnapshotByDate, syncTexasCodeFromTloFtp } from './statutes.ts';
 import type {
   BillSummary,
@@ -122,7 +130,13 @@ function computeKeywordOverlaps(billId: string): KeywordOverlapMatch[] {
 
   const targetTokens = new Set(extractBillTokens(target));
   const others = db
-    .prepare(`SELECT id, bill_number, session, title, summary, stage, subjects_json, statute_codes FROM bills WHERE id != ?`)
+    .prepare(
+      `SELECT id, bill_number, session, title, summary, stage, subjects_json, statute_codes
+       FROM bills
+       WHERE id != ?
+       ORDER BY influence_score DESC
+       LIMIT 600`
+    )
     .all(billId) as Array<{
     id: string;
     bill_number: string;
@@ -285,6 +299,10 @@ apiRouter.get('/bills', (req, res) => {
   const stage = String(req.query.stage ?? '').trim();
   const committee = String(req.query.committee ?? '').trim();
   const sort = String(req.query.sort ?? 'influence').trim();
+  const parsedLimit = Number(req.query.limit);
+  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0
+    ? Math.min(Math.floor(parsedLimit), 10000)
+    : 100;
 
   const where: string[] = ["b.id IS NOT NULL AND typeof(b.id) = 'text' AND typeof(b.session) = 'text'"];
   const params: Array<string | number> = [];
@@ -328,9 +346,9 @@ apiRouter.get('/bills', (req, res) => {
           WHERE bills_fts MATCH ?
           ${where.length ? 'AND ' + where.join(' AND ') : ''}
           ORDER BY ${orderClause}
-          LIMIT 100
+          LIMIT ?
         `;
-        const rows = db.prepare(sql).all(safeFts, ...params) as RawBillRow[];
+        const rows = db.prepare(sql).all(safeFts, ...params, limit) as RawBillRow[];
         return res.json({ bills: rows.map(mapBillRow), queryUsed: safeFts });
       } catch {
         // Fallback to LIKE if FTS syntax is unusual
@@ -345,9 +363,9 @@ apiRouter.get('/bills', (req, res) => {
     FROM bills b
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
     ORDER BY ${orderClause === 'bm25(bills_fts) ASC, b.influence_score DESC' ? 'b.influence_score DESC' : orderClause}
-    LIMIT 100
+    LIMIT ?
   `;
-  const rows = db.prepare(sql).all(...params) as RawBillRow[];
+  const rows = db.prepare(sql).all(...params, limit) as RawBillRow[];
   res.json({ bills: rows.map(mapBillRow), queryUsed: q });
 });
 
@@ -1730,17 +1748,29 @@ apiRouter.get('/tlo/sessions', async (_req, res) => {
 });
 
 apiRouter.post('/tlo/sync', async (req, res) => {
-  const { session, billTypes, limit, startNumber, includeBillText } = req.body ?? {};
+  const {
+    session,
+    billTypes,
+    limit,
+    startNumber,
+    includeBillText,
+    includeWitnesses,
+    skipUnchanged,
+    concurrency,
+  } = req.body ?? {};
   if (!session) {
     return res.status(400).json({ error: 'session code (e.g., 90R, 89R, 88R) is required' });
   }
   try {
     const result = await syncFromTloFtp({
       session: String(session),
-      billTypes: Array.isArray(billTypes) ? billTypes : undefined,
+      billTypes: Array.isArray(billTypes) ? (billTypes as TloBillType[]) : undefined,
       limit: limit ? Number(limit) : 16,
       startNumber: startNumber ? Number(startNumber) : 1,
       includeBillText: includeBillText !== false,
+      includeWitnesses: includeWitnesses !== undefined ? Boolean(includeWitnesses) : undefined,
+      skipUnchanged: Boolean(skipUnchanged),
+      concurrency: concurrency ? Number(concurrency) : 4,
     });
     res.json(result);
   } catch (err) {
@@ -1748,6 +1778,57 @@ apiRouter.post('/tlo/sync', async (req, res) => {
       error: err instanceof Error ? err.message : 'TLO FTP synchronization failed',
     });
   }
+});
+
+apiRouter.post('/tlo/sync-session', (req, res) => {
+  const {
+    session,
+    mode = 'full',
+    billTypes,
+    limit,
+    startNumber,
+    includeBillText,
+    includeWitnesses,
+    skipUnchanged,
+    concurrency,
+  } = req.body ?? {};
+  if (!session) {
+    return res.status(400).json({ error: 'session code (e.g., 90R, 89R, 88R) is required' });
+  }
+
+  const job = startTloSyncJob({
+    session: String(session),
+    mode: mode === 'batch' ? 'batch' : 'full',
+    billTypes: Array.isArray(billTypes) ? (billTypes as TloBillType[]) : undefined,
+    limit: limit ? Number(limit) : undefined,
+    startNumber: startNumber ? Number(startNumber) : 1,
+    includeBillText: includeBillText !== false,
+    includeWitnesses: includeWitnesses !== undefined ? Boolean(includeWitnesses) : undefined,
+    skipUnchanged: skipUnchanged !== false,
+    concurrency: concurrency ? Number(concurrency) : 4,
+  });
+
+  res.status(202).json({ job });
+});
+
+apiRouter.get('/tlo/sync-status', (_req, res) => {
+  res.json({ job: getLatestTloSyncJob() ?? null });
+});
+
+apiRouter.get('/tlo/sync-status/:jobId', (req, res) => {
+  const job = getTloSyncJob(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'Sync job not found' });
+  }
+  res.json({ job });
+});
+
+apiRouter.post('/tlo/sync-cancel/:jobId', (req, res) => {
+  const job = cancelTloSyncJob(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'Sync job not found' });
+  }
+  res.json({ job });
 });
 
 // 11. Optional Secondary AI Brief (Explicitly Secondary to Deterministic Keyword Database)

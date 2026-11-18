@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { Search } from 'lucide-react';
+import { Search, FileSpreadsheet } from 'lucide-react';
 import type { BillAmendment } from '../types.ts';
 import { RedlineDiffPane } from './RedlineDiffPane.tsx';
+import { csvDateStamp, downloadCsv, stripHtmlTags } from '../utils/csv.ts';
 
 interface AmendmentsViewProps {
   activeSession: string;
@@ -50,6 +51,62 @@ export const AmendmentsView: React.FC<AmendmentsViewProps> = ({
       .catch(() => setBillVersions([]));
   }, [selected?.billId]);
 
+  const handleExportAmendmentsCsv = () => {
+    downloadCsv(
+      `texas-amendments-${activeSession || 'all'}-${csvDateStamp()}.csv`,
+      [
+        'Session',
+        'Bill Number',
+        'Bill Title',
+        'Version Code',
+        'Version Label',
+        'Amendment Number',
+        'Sponsor',
+        'Filed Date',
+        'Disposition',
+        'Yea Votes',
+        'Nay Votes',
+        'PNV Votes',
+        'Summary',
+      ],
+      amendments.map((a) => [
+        a.session,
+        a.billNumber,
+        a.billTitle,
+        a.versionCode,
+        a.versionLabel,
+        a.amendmentNumber,
+        a.sponsor,
+        a.filedDate,
+        a.disposition,
+        a.yeaVotes,
+        a.nayVotes,
+        a.pnvVotes,
+        a.snippet ? stripHtmlTags(a.snippet) : a.summary,
+      ])
+    );
+  };
+
+  useEffect(() => {
+    const onExport = () => handleExportAmendmentsCsv();
+    const onStep = (ev: Event) => {
+      const delta = (ev as CustomEvent<{ delta?: number }>).detail?.delta ?? 1;
+      if (amendments.length === 0) return;
+      const curIdx = selected ? amendments.findIndex((a) => a.id === selected.id) : -1;
+      const nextIdx =
+        curIdx === -1
+          ? 0
+          : Math.max(0, Math.min(amendments.length - 1, curIdx + delta));
+      if (amendments[nextIdx]) setSelected(amendments[nextIdx]);
+    };
+    window.addEventListener('capitol:export-csv', onExport);
+    window.addEventListener('capitol:step-item', onStep);
+    return () => {
+      window.removeEventListener('capitol:export-csv', onExport);
+      window.removeEventListener('capitol:step-item', onStep);
+    };
+  }, [amendments, selected, activeSession]);
+
   return (
     <div className="space-y-6">
       <div className="border border-[#DFD9CE] bg-[#F4F0E8] p-4 flex flex-wrap items-center gap-3">
@@ -57,11 +114,17 @@ export const AmendmentsView: React.FC<AmendmentsViewProps> = ({
           <Search className="w-4 h-4 text-[#57534E] absolute left-3 top-1/2 -translate-y-1/2" />
           <input
             type="text"
+            data-global-search="true"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Full-text FTS5 search across archived committee substitutes, floor amendments & enrolled texts..."
-            className="w-full pl-9 pr-4 py-2 bg-[#FFFFFF] border border-[#C5BDB0] text-sm rounded"
+            className="w-full pl-9 pr-10 py-2 bg-[#FFFFFF] border border-[#C5BDB0] text-sm rounded"
           />
+          {!query && (
+            <kbd className="hidden sm:inline-block absolute right-3 top-1/2 -translate-y-1/2 px-1.5 py-0.5 text-[10px] font-mono text-[#78716C] bg-[#FBF9F5] border border-[#DFD9CE] rounded pointer-events-none">
+              /
+            </kbd>
+          )}
         </div>
 
         <select
@@ -77,6 +140,17 @@ export const AmendmentsView: React.FC<AmendmentsViewProps> = ({
           <option value="Failed">Failed</option>
           <option value="Filed">Filed (Base)</option>
         </select>
+
+        <button
+          type="button"
+          onClick={handleExportAmendmentsCsv}
+          disabled={amendments.length === 0}
+          className="px-3 py-2 text-xs font-medium bg-[#FFFFFF] border border-[#C5BDB0] text-[#181715] rounded hover:border-[#181715] disabled:opacity-50 inline-flex items-center gap-1.5 cursor-pointer"
+          title="Export matching amendments to CSV (Shortcut: e)"
+        >
+          <FileSpreadsheet className="w-3.5 h-3.5 text-[#14532D]" />
+          Export CSV
+        </button>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">

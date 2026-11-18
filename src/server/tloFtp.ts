@@ -10,6 +10,12 @@ import {
 } from './db.ts';
 import type { BillStage, Chamber } from '../types.ts';
 
+export type TloBillType =
+  | 'house_bills'
+  | 'senate_bills'
+  | 'house_joint_resolutions'
+  | 'senate_joint_resolutions';
+
 export interface TloSessionInfo {
   code: string;
   label: string;
@@ -18,21 +24,83 @@ export interface TloSessionInfo {
 
 export interface TloSyncOptions {
   session: string;
-  billTypes?: Array<'house_bills' | 'senate_bills' | 'house_joint_resolutions' | 'senate_joint_resolutions'>;
+  billTypes?: TloBillType[];
   limit?: number;
   startNumber?: number;
   includeBillText?: boolean;
+  includeWitnesses?: boolean;
+  skipUnchanged?: boolean;
+  concurrency?: number;
 }
 
 export interface TloSyncResult {
   session: string;
   ingestedCount: number;
+  skippedCount?: number;
+  failedCount?: number;
   amendmentsIngested: number;
   witnessesIngested: number;
   linksCreated: number;
   alertsTriggered: number;
   bills: Array<{ id: string; billNumber: string; title: string; stage: string }>;
   sourceHost: string;
+}
+
+export type TloSyncJobStatus =
+  | 'discovering'
+  | 'syncing'
+  | 'completed'
+  | 'cancelled'
+  | 'error';
+
+export interface TloSyncJob {
+  id: string;
+  session: string;
+  mode: 'full' | 'batch';
+  billTypes: TloBillType[];
+  includeBillText: boolean;
+  includeWitnesses: boolean;
+  skipUnchanged: boolean;
+  concurrency: number;
+  status: TloSyncJobStatus;
+  phase: string;
+  startedAt: string;
+  finishedAt: string | null;
+  totalDiscovered: number;
+  processedCount: number;
+  ingestedCount: number;
+  skippedCount: number;
+  failedCount: number;
+  amendmentsIngested: number;
+  witnessesIngested: number;
+  linksCreated: number;
+  alertsTriggered: number;
+  recentBills: Array<{ id: string; billNumber: string; title: string; stage: string }>;
+  error: string | null;
+  sourceHost: string;
+}
+
+interface InternalJobState extends TloSyncJob {
+  cancelRequested: boolean;
+}
+
+interface DiscoveredBillItem {
+  billType: TloBillType;
+  bucketName: string;
+  remotePath: string;
+  fileName: string;
+  num: number;
+}
+
+const activeJobs = new Map<string, InternalJobState>();
+const jobOrder: string[] = [];
+
+function serializeJob(job: InternalJobState): TloSyncJob {
+  const { cancelRequested: _ignored, ...pub } = job;
+  return {
+    ...pub,
+    recentBills: [...pub.recentBills],
+  };
 }
 
 function parseWitnessListHtml(
@@ -59,7 +127,9 @@ function parseWitnessListHtml(
     .trim();
 
   const comMatch = clean.match(/([A-Za-z0-9 &,-]+?)\s+Committee\s+([A-Z][a-z]+\s+\d+,\s+\d{4})/i);
-  const committeeName = comMatch ? comMatch[1].replace(/^(?:HOUSE|SENATE)\s+COMMITTEE\s+REPORT\s+/i, '').trim() : defaultCommittee;
+  const committeeName = comMatch
+    ? comMatch[1].replace(/^(?:HOUSE|SENATE)\s+COMMITTEE\s+REPORT\s+/i, '').trim()
+    : defaultCommittee;
   const hearingDate = comMatch ? comMatch[2].trim() : '';
 
   const results: Array<{
@@ -197,31 +267,66 @@ function parseBillNumberMeta(billNumber: string): {
   bucket: string;
 } {
   const cleaned = billNumber.replace(/\s+/g, ' ').trim().toUpperCase();
-  const m = cleaned.match(/^([A-Z]+)\s+(\d+)$/);
+  const m = cleaned.match(/^([A-Z]+)\s*(\d+)$/);
   const prefix = m ? m[1] : 'HB';
   const num = m ? parseInt(m[2], 10) : 1;
   const chamber: Chamber = prefix.startsWith('S') ? 'Senate' : 'House';
   const padded = `${prefix}${String(num).padStart(5, '0')}`;
-  const bucketStart = Math.floor((num - 1) / 100) * 100 + 1;
-  const bucketEnd = bucketStart + 99;
+  const bucketStart = num < 100 ? 1 : Math.floor(num / 100) * 100;
+  const bucketEnd = num < 100 ? 99 : bucketStart + 99;
   const bucket = `${prefix}${String(bucketStart).padStart(5, '0')}_${prefix}${String(bucketEnd).padStart(5, '0')}`;
   return { chamber, prefix, num, padded, bucket };
 }
 
 async function downloadString(client: ftp.Client, remotePath: string): Promise<string> {
-  let buffer = '';
+  const chunks: Buffer[] = [];
   const writable = new Writable({
     write(chunk, _enc, cb) {
-      buffer += chunk.toString('utf8');
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       cb();
     },
   });
   await client.downloadTo(writable, remotePath);
-  return buffer;
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+async function ensureFtpConnected(clientRef: { current: ftp.Client }): Promise<ftp.Client> {
+  if (!clientRef.current.closed) {
+    return clientRef.current;
+  }
+  const fresh = new ftp.Client(15000);
+  await fresh.access({ host: 'ftp.legis.state.tx.us' });
+  clientRef.current = fresh;
+  return fresh;
+}
+
+async function withFtpRetry<T>(
+  clientRef: { current: ftp.Client },
+  operation: (client: ftp.Client) => Promise<T>
+): Promise<T> {
+  try {
+    const c = await ensureFtpConnected(clientRef);
+    return await operation(c);
+  } catch (err) {
+    const code = (err as { code?: number | string })?.code;
+    // Do not retry permanent 550 "file/directory not found" errors
+    if (code === 550) {
+      throw err;
+    }
+    try {
+      clientRef.current.close();
+    } catch {
+      // ignore close errors
+    }
+    const fresh = new ftp.Client(15000);
+    await fresh.access({ host: 'ftp.legis.state.tx.us' });
+    clientRef.current = fresh;
+    return await operation(fresh);
+  }
 }
 
 export async function listTloFtpSessions(): Promise<TloSessionInfo[]> {
-  const client = new ftp.Client(8000);
+  const client = new ftp.Client(10000);
   try {
     await client.access({ host: 'ftp.legis.state.tx.us' });
     const list = await client.list('/bills');
@@ -248,38 +353,101 @@ const VERSION_LABELS: Record<string, string> = {
   F: 'Enrolled (Final)',
 };
 
-export async function syncFromTloFtp(options: TloSyncOptions): Promise<TloSyncResult> {
-  const session = options.session.trim();
-  const billTypes = options.billTypes?.length
-    ? options.billTypes
-    : ['house_bills', 'senate_bills'];
-  const limit = Math.min(Math.max(options.limit ?? 20, 1), 80);
-  const startNumber = Math.max(options.startNumber ?? 1, 1);
-  const includeBillText = options.includeBillText !== false;
+/**
+ * Shared bucket directory index: lists each 100-bill directory ONCE across all workers
+ * and indexes filenames by bill prefix (e.g. HB00001 -> ['HB00001I.htm', 'HB00001E.htm']).
+ */
+function createBucketIndexCache(session: string, subRoot: 'billtext/html' | 'witlistbill/html') {
+  const cache = new Map<string, Promise<Map<string, string[]>>>();
 
-  const client = new ftp.Client(12000);
-  const ingestedBills: Array<{ id: string; billNumber: string; title: string; stage: string }> = [];
-  let amendmentsIngested = 0;
-  let witnessesIngested = 0;
-  let linksCreated = 0;
+  return (
+    clientRef: { current: ftp.Client },
+    billType: TloBillType,
+    bucket: string
+  ): Promise<Map<string, string[]>> => {
+    const key = `${billType}/${bucket}`;
+    const existing = cache.get(key);
+    if (existing) return existing;
+
+    const promise = (async () => {
+      const index = new Map<string, string[]>();
+      const dirPath = `/bills/${session}/${subRoot}/${billType}/${bucket}`;
+      try {
+        const files = await withFtpRetry(clientRef, (c) => c.list(dirPath));
+        for (const f of files) {
+          if (!f.name.toLowerCase().endsWith('.htm')) continue;
+          const prefixMatch = f.name.toUpperCase().match(/^([A-Z]+\d{5})/);
+          if (!prefixMatch) continue;
+          const pfx = prefixMatch[1];
+          const list = index.get(pfx);
+          if (list) list.push(f.name);
+          else index.set(pfx, [f.name]);
+        }
+        for (const list of index.values()) {
+          list.sort((a, b) => a.localeCompare(b));
+        }
+      } catch {
+        // Directory may not exist for early pre-files or sessions with no hearings yet
+      }
+      return index;
+    })();
+
+    cache.set(key, promise);
+    return promise;
+  };
+}
+
+interface CoreIngestParams {
+  session: string;
+  billTypes: TloBillType[];
+  limit: number | null;
+  startNumber: number;
+  includeBillText: boolean;
+  includeWitnesses: boolean;
+  skipUnchanged: boolean;
+  concurrency: number;
+  job?: InternalJobState;
+}
+
+async function runConcurrentTloSync(params: CoreIngestParams): Promise<TloSyncResult> {
+  const {
+    session,
+    billTypes,
+    limit,
+    startNumber,
+    includeBillText,
+    includeWitnesses,
+    skipUnchanged,
+    concurrency,
+    job,
+  } = params;
+
+  const sessMeta = formatSessionMetadata(session);
+  db.prepare(
+    `INSERT OR IGNORE INTO sessions (code, label, years, synced_at, bill_count)
+     VALUES (?, ?, ?, ?, 0)`
+  ).run(sessMeta.code, sessMeta.label, sessMeta.years, new Date().toISOString());
+
+  // 1. Discover bill XML files using a single discovery client
+  const discoveryRef = { current: new ftp.Client(15000) };
+  const candidates: DiscoveredBillItem[] = [];
 
   try {
-    await client.access({ host: 'ftp.legis.state.tx.us' });
-
-    const sessMeta = formatSessionMetadata(session);
-    db.prepare(
-      `INSERT OR IGNORE INTO sessions (code, label, years, synced_at, bill_count)
-       VALUES (?, ?, ?, ?, 0)`
-    ).run(sessMeta.code, sessMeta.label, sessMeta.years, new Date().toISOString());
-
-    const perTypeLimit = Math.max(1, Math.ceil(limit / billTypes.length));
+    await discoveryRef.current.access({ host: 'ftp.legis.state.tx.us' });
+    const perTypeLimit = limit !== null ? Math.max(1, Math.ceil(limit / billTypes.length)) : null;
 
     for (const billType of billTypes) {
-      if (ingestedBills.length >= limit) break;
+      if (job?.cancelRequested) break;
+      if (limit !== null && candidates.length >= limit) break;
+
+      if (job) {
+        job.phase = `Scanning ${session} ${billType.replace(/_/g, ' ')} directories…`;
+      }
+
       const baseDir = `/bills/${session}/billhistory/${billType}`;
       let buckets: ftp.FileInfo[] = [];
       try {
-        buckets = await client.list(baseDir);
+        buckets = await withFtpRetry(discoveryRef, (c) => c.list(baseDir));
       } catch {
         continue;
       }
@@ -288,9 +456,10 @@ export async function syncFromTloFtp(options: TloSyncOptions): Promise<TloSyncRe
         .filter((b) => b.isDirectory)
         .sort((a, b) => a.name.localeCompare(b.name));
 
-      const candidateFiles: Array<{ remotePath: string; fileName: string; num: number }> = [];
-
+      const typeCandidates: DiscoveredBillItem[] = [];
       for (const bucket of sortedBuckets) {
+        if (job?.cancelRequested) break;
+
         const rangeMatch = bucket.name.match(/(\d+)_[A-Z]+(\d+)/);
         if (rangeMatch) {
           const rangeEnd = parseInt(rangeMatch[2], 10);
@@ -299,7 +468,7 @@ export async function syncFromTloFtp(options: TloSyncOptions): Promise<TloSyncRe
 
         let files: ftp.FileInfo[] = [];
         try {
-          files = await client.list(`${baseDir}/${bucket.name}`);
+          files = await withFtpRetry(discoveryRef, (c) => c.list(`${baseDir}/${bucket.name}`));
         } catch {
           continue;
         }
@@ -309,6 +478,8 @@ export async function syncFromTloFtp(options: TloSyncOptions): Promise<TloSyncRe
           .map((f) => {
             const m = f.name.match(/(\d+)\.xml$/i);
             return {
+              billType,
+              bucketName: bucket.name,
               remotePath: `${baseDir}/${bucket.name}/${f.name}`,
               fileName: f.name,
               num: m ? parseInt(m[1], 10) : 999999,
@@ -317,18 +488,238 @@ export async function syncFromTloFtp(options: TloSyncOptions): Promise<TloSyncRe
           .filter((f) => f.num >= startNumber)
           .sort((a, b) => a.num - b.num);
 
-        candidateFiles.push(...xmlFiles);
-        if (candidateFiles.length >= perTypeLimit) break;
+        typeCandidates.push(...xmlFiles);
+        if (job) {
+          job.totalDiscovered = candidates.length + typeCandidates.length;
+        }
+        if (perTypeLimit !== null && typeCandidates.length >= perTypeLimit) break;
       }
 
-      const toFetch = candidateFiles.slice(0, perTypeLimit);
+      const chosen = perTypeLimit !== null ? typeCandidates.slice(0, perTypeLimit) : typeCandidates;
+      candidates.push(...chosen);
+      if (job) {
+        job.totalDiscovered = candidates.length;
+      }
+    }
+  } finally {
+    try {
+      discoveryRef.current.close();
+    } catch {
+      // ignore
+    }
+  }
 
-      for (const item of toFetch) {
-        if (ingestedBills.length >= limit) break;
+  if (job?.cancelRequested) {
+    return {
+      session,
+      ingestedCount: job.ingestedCount,
+      skippedCount: job.skippedCount,
+      failedCount: job.failedCount,
+      amendmentsIngested: job.amendmentsIngested,
+      witnessesIngested: job.witnessesIngested,
+      linksCreated: job.linksCreated,
+      alertsTriggered: job.alertsTriggered,
+      bills: job.recentBills,
+      sourceHost: 'ftp://ftp.legis.state.tx.us',
+    };
+  }
+
+  const finalQueue = limit !== null ? candidates.slice(0, limit) : candidates;
+  if (job) {
+    job.totalDiscovered = finalQueue.length;
+    job.status = 'syncing';
+    job.phase =
+      finalQueue.length === 0
+        ? `No matching XML files found in ${session}.`
+        : `Syncing ${finalQueue.length.toLocaleString()} bills across ${concurrency} FTP workers…`;
+  }
+
+  // Prepared SQLite statements reused across all workers (better-sqlite3 is synchronous on main thread)
+  const selectExistingStmt = db.prepare(
+    `SELECT last_action, last_action_date, amendment_count FROM bills WHERE id = ?`
+  );
+  const upsertBillStmt = db.prepare(
+    `INSERT OR REPLACE INTO bills (
+      id, session, bill_number, chamber, title, summary, statute_codes, status, stage,
+      primary_author, coauthors_json, sponsors_json, cosponsors_json, committees_json,
+      subjects_json, last_action, last_action_date, filed_date, source, full_text
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const deleteActionsStmt = db.prepare(`DELETE FROM bill_actions WHERE bill_id = ?`);
+  const insertActionStmt = db.prepare(
+    `INSERT OR REPLACE INTO bill_actions (id, bill_id, action_date, action_number, description)
+     VALUES (?, ?, ?, ?, ?)`
+  );
+  const upsertAmendStmt = db.prepare(
+    `INSERT OR REPLACE INTO amendments (
+      id, bill_id, version_code, version_label, amendment_number, sponsor, filed_date,
+      disposition, yea_votes, nay_votes, pnv_votes, summary, full_text, sort_order
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const checkBillExistsStmt = db.prepare(`SELECT id FROM bills WHERE id = ?`);
+  const insertLinkStmt = db.prepare(
+    `INSERT OR IGNORE INTO bill_links (id, source_bill_id, target_bill_id, link_type, notes, created_at)
+     VALUES (?, ?, ?, 'Companion', 'Imported from TLO <companions> metadata', ?)`
+  );
+  const deleteWitnessesStmt = db.prepare(`DELETE FROM witness_registrations WHERE bill_id = ? AND source LIKE 'TLO FTP%'`);
+  const insertWitnessStmt = db.prepare(
+    `INSERT OR REPLACE INTO witness_registrations
+     (id, bill_id, chamber, committee_name, hearing_date, witness_name, affiliation, is_citizen_self, position, testified, source)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+
+  const getTextBucket = createBucketIndexCache(session, 'billtext/html');
+  const getWitBucket = createBucketIndexCache(session, 'witlistbill/html');
+
+  const ingestedBills: Array<{ id: string; billNumber: string; title: string; stage: string }> = [];
+  let ingestedCount = 0;
+  let skippedCount = 0;
+  let failedCount = 0;
+  let amendmentsIngested = 0;
+  let witnessesIngested = 0;
+  let linksCreated = 0;
+  let processedCount = 0;
+  let cursor = 0;
+
+  const persistBillTransaction = db.transaction(
+    (payload: {
+      billId: string;
+      billNumber: string;
+      chamber: Chamber;
+      caption: string;
+      primaryAuthor: string;
+      coauthors: string[];
+      sponsors: string[];
+      cosponsors: string[];
+      committees: Array<{ name: string; chamber: Chamber; status: string; ayeVotes: number; nayVotes: number }>;
+      subjects: string[];
+      statuteMatches: string[];
+      lastAction: string;
+      lastActionDate: string;
+      filedDate: string;
+      stage: BillStage;
+      latestText: string;
+      parsedActions: Array<{ id: string; actionDate: string; actionNumber: string; description: string }>;
+      versionRows: Array<{ id: string; versionCode: string; versionLabel: string; text: string; sortOrder: number }>;
+      companionNums: string[];
+      witnessRows: Array<{
+        id: string;
+        chamber: Chamber;
+        committeeName: string;
+        hearingDate: string;
+        witnessName: string;
+        affiliation: string;
+        isCitizenSelf: number;
+        position: 'For' | 'Against' | 'On';
+        testified: number;
+      }>;
+    }) => {
+      upsertBillStmt.run(
+        payload.billId,
+        session,
+        payload.billNumber,
+        payload.chamber,
+        payload.caption,
+        `TLO FTP Record (${session} ${payload.billNumber}) — ${payload.lastAction || 'Filed in ' + payload.chamber}. Primary author: ${payload.primaryAuthor}.`,
+        JSON.stringify(payload.statuteMatches),
+        payload.lastAction || payload.stage,
+        payload.stage,
+        payload.primaryAuthor,
+        JSON.stringify(payload.coauthors),
+        JSON.stringify(payload.sponsors),
+        JSON.stringify(payload.cosponsors),
+        JSON.stringify(payload.committees),
+        JSON.stringify(payload.subjects),
+        payload.lastAction,
+        payload.lastActionDate,
+        payload.filedDate,
+        `ftp://ftp.legis.state.tx.us/bills/${session}`,
+        payload.latestText
+      );
+
+      deleteActionsStmt.run(payload.billId);
+      for (const act of payload.parsedActions) {
+        insertActionStmt.run(act.id, payload.billId, act.actionDate, act.actionNumber, act.description);
+      }
+
+      for (const vr of payload.versionRows) {
+        upsertAmendStmt.run(
+          vr.id,
+          payload.billId,
+          vr.versionCode,
+          vr.versionLabel,
+          `${payload.billNumber} (${vr.versionCode})`,
+          payload.primaryAuthor,
+          payload.filedDate,
+          vr.versionCode === 'F' ? 'Enacted' : vr.versionCode === 'I' ? 'Filed' : 'Substituted',
+          payload.committees[0]?.ayeVotes ?? 0,
+          payload.committees[0]?.nayVotes ?? 0,
+          0,
+          `${vr.versionLabel} downloaded from TLO FTP`,
+          vr.text,
+          vr.sortOrder
+        );
+        syncAmendmentFts(vr.id);
+      }
+
+      let addedLinks = 0;
+      for (const compNum of payload.companionNums) {
+        const targetId = `${session}-${compNum.replace(/\s+/g, '')}`;
+        if (checkBillExistsStmt.get(targetId)) {
+          const info = insertLinkStmt.run(
+            `lnk-${payload.billId}-${targetId}`,
+            payload.billId,
+            targetId,
+            new Date().toISOString()
+          );
+          addedLinks += info.changes;
+        }
+      }
+
+      if (payload.witnessRows.length > 0) {
+        deleteWitnessesStmt.run(payload.billId);
+        for (const w of payload.witnessRows) {
+          insertWitnessStmt.run(
+            w.id,
+            payload.billId,
+            w.chamber,
+            w.committeeName,
+            w.hearingDate,
+            w.witnessName,
+            w.affiliation,
+            w.isCitizenSelf,
+            w.position,
+            w.testified,
+            `TLO FTP witlistbill (${session})`
+          );
+        }
+      }
+
+      syncBillFts(payload.billId);
+      recomputeBillMetrics(payload.billId);
+      return addedLinks;
+    }
+  );
+
+  const workerCount = Math.min(Math.max(concurrency, 1), Math.max(1, finalQueue.length));
+
+  const runWorker = async () => {
+    const clientRef = { current: new ftp.Client(15000) };
+    try {
+      await clientRef.current.access({ host: 'ftp.legis.state.tx.us' });
+
+      while (true) {
+        if (job?.cancelRequested) break;
+        const myIdx = cursor++;
+        if (myIdx >= finalQueue.length) break;
+
+        const item = finalQueue[myIdx];
         try {
-          const xml = await downloadString(client, item.remotePath);
+          const xml = await withFtpRetry(clientRef, (c) => downloadString(c, item.remotePath));
           const rawBillAttr = xml.match(/bill="([^"]+)"/i)?.[1] ?? '';
-          const billNumber = rawBillAttr.replace(/^\d+\([A-Z0-9]+\)\s*/i, '').trim() || item.fileName.replace(/\.xml$/i, '');
+          const billNumber =
+            rawBillAttr.replace(/^\d+\([A-Z0-9]+\)\s*/i, '').trim() ||
+            item.fileName.replace(/\.xml$/i, '');
           const billId = `${session}-${billNumber.replace(/\s+/g, '')}`;
           const meta = parseBillNumberMeta(billNumber);
 
@@ -336,6 +727,26 @@ export async function syncFromTloFtp(options: TloSyncOptions): Promise<TloSyncRe
           const lastAction = extractTag(xml, 'lastaction');
           const lastActionDateMatch = lastAction.match(/^(\d{2}\/\d{2}\/\d{4})/);
           const lastActionDate = lastActionDateMatch ? lastActionDateMatch[1] : '';
+
+          if (skipUnchanged) {
+            const existing = selectExistingStmt.get(billId) as
+              | { last_action: string; last_action_date: string; amendment_count: number }
+              | undefined;
+            if (
+              existing &&
+              existing.last_action === lastAction &&
+              existing.last_action_date === lastActionDate &&
+              (!includeBillText || existing.amendment_count > 0)
+            ) {
+              skippedCount++;
+              processedCount++;
+              if (job) {
+                job.skippedCount = skippedCount;
+                job.processedCount = processedCount;
+              }
+              continue;
+            }
+          }
 
           const authors = extractTag(xml, 'authors')
             .split('|')
@@ -393,7 +804,6 @@ export async function syncFromTloFtp(options: TloSyncOptions): Promise<TloSyncRe
           const filedDate = parsedActions[0]?.actionDate || lastActionDate || 'Pre-Filed';
           const stage = inferStageFromTlo(lastAction, committees);
 
-          // Optionally fetch actual HTML bill versions from TLO FTP
           let latestText = caption;
           const versionRows: Array<{
             id: string;
@@ -403,19 +813,22 @@ export async function syncFromTloFtp(options: TloSyncOptions): Promise<TloSyncRe
             sortOrder: number;
           }> = [];
 
-          if (includeBillText) {
-            const textDir = `/bills/${session}/billtext/html/${billType}/${meta.bucket}`;
-            try {
-              const textFiles = await client.list(textDir);
-              const matching = textFiles
-                .filter((tf) => tf.name.toUpperCase().startsWith(meta.padded) && tf.name.toLowerCase().endsWith('.htm'))
-                .sort((a, b) => a.name.localeCompare(b.name));
+          const targetBucket = item.bucketName || meta.bucket;
 
-              const orderMap: Record<string, number> = { I: 1, H: 2, E: 3, S: 4, F: 5 };
-              for (const tf of matching) {
-                const vMatch = tf.name.match(/([IHESF])\.htm$/i);
-                const vCode = vMatch ? vMatch[1].toUpperCase() : 'I';
-                const html = await downloadString(client, `${textDir}/${tf.name}`);
+          if (includeBillText) {
+            const bucketMap = await getTextBucket(clientRef, item.billType, targetBucket);
+            const matchingNames = bucketMap.get(meta.padded) ?? [];
+            const orderMap: Record<string, number> = { I: 1, H: 2, E: 3, S: 4, F: 5 };
+            const textDir = `/bills/${session}/billtext/html/${item.billType}/${targetBucket}`;
+
+            for (const fileName of matchingNames) {
+              if (job?.cancelRequested) break;
+              const vMatch = fileName.match(/([IHESF])\.htm$/i);
+              const vCode = vMatch ? vMatch[1].toUpperCase() : 'I';
+              try {
+                const html = await withFtpRetry(clientRef, (c) =>
+                  downloadString(c, `${textDir}/${fileName}`)
+                );
                 const plain = htmlToPlainText(html);
                 if (plain) {
                   versionRows.push({
@@ -426,14 +839,72 @@ export async function syncFromTloFtp(options: TloSyncOptions): Promise<TloSyncRe
                     sortOrder: orderMap[vCode] ?? 2,
                   });
                 }
+              } catch {
+                // Skip unreadable HTML version
               }
-              versionRows.sort((a, b) => a.sortOrder - b.sortOrder);
-              if (versionRows.length > 0) {
-                latestText = versionRows[versionRows.length - 1].text;
-              }
-            } catch {
-              // Bill text directory might not exist for some early pre-files
             }
+            versionRows.sort((a, b) => a.sortOrder - b.sortOrder);
+            if (versionRows.length > 0) {
+              latestText = versionRows[versionRows.length - 1].text;
+            }
+          }
+
+          const witnessRows: Array<{
+            id: string;
+            chamber: Chamber;
+            committeeName: string;
+            hearingDate: string;
+            witnessName: string;
+            affiliation: string;
+            isCitizenSelf: number;
+            position: 'For' | 'Against' | 'On';
+            testified: number;
+          }> = [];
+
+          if (includeWitnesses) {
+            const witMap = await getWitBucket(clientRef, item.billType, targetBucket);
+            const matchingWit = witMap.get(meta.padded) ?? [];
+            const witDir = `/bills/${session}/witlistbill/html/${item.billType}/${targetBucket}`;
+
+            for (const wfName of matchingWit) {
+              if (job?.cancelRequested) break;
+              try {
+                const witHtml = await withFtpRetry(clientRef, (c) =>
+                  downloadString(c, `${witDir}/${wfName}`)
+                );
+                const witChamber: Chamber = wfName.toUpperCase().endsWith('S.HTM')
+                  ? 'Senate'
+                  : 'House';
+                const parsedWit = parseWitnessListHtml(
+                  witHtml,
+                  billId,
+                  witChamber,
+                  committees[0]?.name || 'Standing Committee'
+                );
+                for (const w of parsedWit) {
+                  witnessRows.push({
+                    id: `${w.id}-${witChamber}`,
+                    chamber: witChamber,
+                    committeeName: w.committeeName,
+                    hearingDate: w.hearingDate,
+                    witnessName: w.witnessName,
+                    affiliation: w.affiliation,
+                    isCitizenSelf: w.isCitizenSelf,
+                    position: w.position,
+                    testified: w.testified,
+                  });
+                }
+              } catch {
+                // Skip unreadable witness HTML
+              }
+            }
+          }
+
+          const companionsXml = extractTag(xml, 'companions');
+          const companionNums: string[] = [];
+          for (const cmMatch of companionsXml.matchAll(/<bill[^>]*>([^<]+)<\/bill>/gi)) {
+            const compNum = cmMatch[1].trim();
+            if (compNum) companionNums.push(compNum);
           }
 
           const primaryAuthor = authors[0] || 'Unassigned';
@@ -445,153 +916,247 @@ export async function syncFromTloFtp(options: TloSyncOptions): Promise<TloSyncRe
             )
           );
 
-          db.prepare(
-            `INSERT OR REPLACE INTO bills (
-              id, session, bill_number, chamber, title, summary, statute_codes, status, stage,
-              primary_author, coauthors_json, sponsors_json, cosponsors_json, committees_json,
-              subjects_json, last_action, last_action_date, filed_date, source, full_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          ).run(
+          const addedLinks = persistBillTransaction({
             billId,
-            session,
             billNumber,
-            meta.chamber,
+            chamber: meta.chamber,
             caption,
-            `TLO FTP Record (${session} ${billNumber}) — ${lastAction || 'Filed in ' + meta.chamber}. Primary author: ${primaryAuthor}.`,
-            JSON.stringify(statuteMatches),
-            lastAction || stage,
-            stage,
             primaryAuthor,
-            JSON.stringify(coauthors),
-            JSON.stringify(sponsors),
-            JSON.stringify(cosponsors),
-            JSON.stringify(committees),
-            JSON.stringify(subjects),
+            coauthors,
+            sponsors,
+            cosponsors,
+            committees,
+            subjects,
+            statuteMatches,
             lastAction,
             lastActionDate,
             filedDate,
-            `ftp://ftp.legis.state.tx.us/bills/${session}`,
-            latestText
-          );
+            stage,
+            latestText,
+            parsedActions,
+            versionRows,
+            companionNums,
+            witnessRows,
+          });
 
-          db.prepare(`DELETE FROM bill_actions WHERE bill_id = ?`).run(billId);
-          const insertAct = db.prepare(
-            `INSERT OR REPLACE INTO bill_actions (id, bill_id, action_date, action_number, description)
-             VALUES (?, ?, ?, ?, ?)`
-          );
-          for (const act of parsedActions) {
-            insertAct.run(act.id, billId, act.actionDate, act.actionNumber, act.description);
-          }
+          ingestedCount++;
+          amendmentsIngested += versionRows.length;
+          witnessesIngested += witnessRows.length;
+          linksCreated += addedLinks;
+          processedCount++;
 
-          for (const vr of versionRows) {
-            db.prepare(
-              `INSERT OR REPLACE INTO amendments (
-                id, bill_id, version_code, version_label, amendment_number, sponsor, filed_date,
-                disposition, yea_votes, nay_votes, pnv_votes, summary, full_text, sort_order
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-            ).run(
-              vr.id,
-              billId,
-              vr.versionCode,
-              vr.versionLabel,
-              `${billNumber} (${vr.versionCode})`,
-              primaryAuthor,
-              filedDate,
-              vr.versionCode === 'F' ? 'Enacted' : vr.versionCode === 'I' ? 'Filed' : 'Substituted',
-              committees[0]?.ayeVotes ?? 0,
-              committees[0]?.nayVotes ?? 0,
-              0,
-              `${vr.versionLabel} downloaded from TLO FTP`,
-              vr.text,
-              vr.sortOrder
-            );
-            syncAmendmentFts(vr.id);
-            amendmentsIngested++;
-          }
-
-          // Parse <companions> for automatic cross-bill linking
-          const companionsXml = extractTag(xml, 'companions');
-          const companionMatches = companionsXml.matchAll(/<bill[^>]*>([^<]+)<\/bill>/gi);
-          for (const cmMatch of companionMatches) {
-            const compNum = cmMatch[1].trim();
-            const targetId = `${session}-${compNum.replace(/\s+/g, '')}`;
-            const exists = db.prepare(`SELECT id FROM bills WHERE id = ?`).get(targetId);
-            if (exists) {
-              db.prepare(
-                `INSERT OR IGNORE INTO bill_links (id, source_bill_id, target_bill_id, link_type, notes, created_at)
-                 VALUES (?, ?, ?, 'Companion', 'Imported from TLO <companions> metadata', ?)`
-              ).run(`lnk-${billId}-${targetId}`, billId, targetId, new Date().toISOString());
-              linksCreated++;
+          const summaryEntry = { id: billId, billNumber, title: caption, stage };
+          if (job) {
+            job.ingestedCount = ingestedCount;
+            job.amendmentsIngested = amendmentsIngested;
+            job.witnessesIngested = witnessesIngested;
+            job.linksCreated = linksCreated;
+            job.processedCount = processedCount;
+            job.recentBills.unshift(summaryEntry);
+            if (job.recentBills.length > 25) job.recentBills.length = 25;
+            if (ingestedCount % 100 === 0) {
+              refreshSessionCounts();
+              job.phase = `Syncing ${processedCount.toLocaleString()} / ${finalQueue.length.toLocaleString()} bills (${workerCount} FTP workers)…`;
             }
-          }
-
-          syncBillFts(billId);
-
-          // Fetch real TLO committee witness lists (witlistbill/html) if present
-          try {
-            const witDir = `/bills/${session}/witlistbill/html/${billType}/${meta.bucket}`;
-            const witFiles = await client.list(witDir);
-            const matchingWit = witFiles.filter(
-              (wf) => wf.name.toUpperCase().startsWith(meta.padded) && wf.name.toLowerCase().endsWith('.htm')
-            );
-            const insertWit = db.prepare(
-              `INSERT OR REPLACE INTO witness_registrations
-               (id, bill_id, chamber, committee_name, hearing_date, witness_name, affiliation, is_citizen_self, position, testified, source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-            );
-            for (const wf of matchingWit) {
-              const witHtml = await downloadString(client, `${witDir}/${wf.name}`);
-              const witChamber: Chamber = wf.name.toUpperCase().endsWith('S.HTM') ? 'Senate' : 'House';
-              const parsedWit = parseWitnessListHtml(
-                witHtml,
-                billId,
-                witChamber,
-                committees[0]?.name || 'Standing Committee'
-              );
-              for (const w of parsedWit) {
-                insertWit.run(
-                  `${w.id}-${witChamber}`,
-                  billId,
-                  witChamber,
-                  w.committeeName,
-                  w.hearingDate,
-                  w.witnessName,
-                  w.affiliation,
-                  w.isCitizenSelf,
-                  w.position,
-                  w.testified,
-                  `TLO FTP witlistbill (${session})`
-                );
-                witnessesIngested++;
-              }
+            if (ingestedCount % 500 === 0) {
+              job.alertsTriggered += evaluateAlertRules();
             }
-          } catch {
-            // Witness list may not exist for bills without hearings
+          } else {
+            ingestedBills.push(summaryEntry);
           }
-
-          recomputeBillMetrics(billId);
-          ingestedBills.push({ id: billId, billNumber, title: caption, stage });
         } catch {
-          // Skip individual malformed or unreachable bill file
+          failedCount++;
+          processedCount++;
+          if (job) {
+            job.failedCount = failedCount;
+            job.processedCount = processedCount;
+          }
         }
       }
+    } finally {
+      try {
+        clientRef.current.close();
+      } catch {
+        // ignore
+      }
     }
+  };
 
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+
+  let finalAlerts = 0;
+  if (db.open) {
     db.prepare(`UPDATE sessions SET synced_at = ? WHERE code = ?`).run(new Date().toISOString(), session);
     refreshSessionCounts();
-    const alertsTriggered = evaluateAlertRules();
-
-    return {
-      session,
-      ingestedCount: ingestedBills.length,
-      amendmentsIngested,
-      witnessesIngested,
-      linksCreated,
-      alertsTriggered,
-      bills: ingestedBills,
-      sourceHost: 'ftp://ftp.legis.state.tx.us',
-    };
-  } finally {
-    client.close();
+    finalAlerts = evaluateAlertRules();
+    if (job) {
+      job.alertsTriggered += finalAlerts;
+    }
   }
+
+  return {
+    session,
+    ingestedCount,
+    skippedCount,
+    failedCount,
+    amendmentsIngested,
+    witnessesIngested,
+    linksCreated,
+    alertsTriggered: job ? job.alertsTriggered : finalAlerts,
+    bills: job ? job.recentBills : ingestedBills,
+    sourceHost: 'ftp://ftp.legis.state.tx.us',
+  };
+}
+
+export async function syncFromTloFtp(options: TloSyncOptions): Promise<TloSyncResult> {
+  const session = options.session.trim();
+  const billTypes: TloBillType[] = options.billTypes?.length
+    ? options.billTypes
+    : ['house_bills', 'senate_bills'];
+  const limit = Math.min(Math.max(options.limit ?? 20, 1), 200);
+  const startNumber = Math.max(options.startNumber ?? 1, 1);
+  const includeBillText = options.includeBillText !== false;
+  const includeWitnesses = options.includeWitnesses ?? includeBillText;
+  const skipUnchanged = options.skipUnchanged ?? false;
+  const concurrency = Math.min(Math.max(options.concurrency ?? 4, 1), 6);
+
+  return runConcurrentTloSync({
+    session,
+    billTypes,
+    limit,
+    startNumber,
+    includeBillText,
+    includeWitnesses,
+    skipUnchanged,
+    concurrency,
+  });
+}
+
+export interface TloSyncJobOptions {
+  session: string;
+  mode: 'full' | 'batch';
+  billTypes?: TloBillType[];
+  limit?: number;
+  startNumber?: number;
+  includeBillText?: boolean;
+  includeWitnesses?: boolean;
+  skipUnchanged?: boolean;
+  concurrency?: number;
+}
+
+export function startTloSyncJob(options: TloSyncJobOptions): TloSyncJob {
+  // Reuse active running job if one is already running so modest servers don't double-load FTP
+  const existingRunning = getLatestRunningTloSyncJob();
+  if (existingRunning) {
+    return existingRunning;
+  }
+
+  const session = options.session.trim();
+  const billTypes: TloBillType[] = options.billTypes?.length
+    ? options.billTypes
+    : ['house_bills', 'senate_bills'];
+  const mode = options.mode === 'batch' ? 'batch' : 'full';
+  const limit = mode === 'full' ? null : Math.min(Math.max(options.limit ?? 100, 1), 5000);
+  const startNumber = Math.max(options.startNumber ?? 1, 1);
+  const includeBillText = options.includeBillText !== false;
+  const includeWitnesses = options.includeWitnesses ?? includeBillText;
+  const skipUnchanged = options.skipUnchanged !== false;
+  const concurrency = Math.min(Math.max(options.concurrency ?? 4, 1), 6);
+
+  const id = `tlo-${session}-${Date.now()}`;
+  const job: InternalJobState = {
+    id,
+    session,
+    mode,
+    billTypes,
+    includeBillText,
+    includeWitnesses,
+    skipUnchanged,
+    concurrency,
+    status: 'discovering',
+    phase: `Connecting to ftp.legis.state.tx.us for ${session}…`,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    totalDiscovered: 0,
+    processedCount: 0,
+    ingestedCount: 0,
+    skippedCount: 0,
+    failedCount: 0,
+    amendmentsIngested: 0,
+    witnessesIngested: 0,
+    linksCreated: 0,
+    alertsTriggered: 0,
+    recentBills: [],
+    error: null,
+    sourceHost: 'ftp://ftp.legis.state.tx.us',
+    cancelRequested: false,
+  };
+
+  activeJobs.set(id, job);
+  jobOrder.unshift(id);
+  if (jobOrder.length > 10) {
+    const oldId = jobOrder.pop();
+    if (oldId) activeJobs.delete(oldId);
+  }
+
+  void runConcurrentTloSync({
+    session,
+    billTypes,
+    limit,
+    startNumber,
+    includeBillText,
+    includeWitnesses,
+    skipUnchanged,
+    concurrency,
+    job,
+  })
+    .then(() => {
+      job.status = job.cancelRequested ? 'cancelled' : 'completed';
+      job.phase = job.cancelRequested
+        ? `Cancelled after ${job.ingestedCount.toLocaleString()} synced (${job.skippedCount.toLocaleString()} skipped).`
+        : `Completed ${job.session}: ${job.ingestedCount.toLocaleString()} synced, ${job.skippedCount.toLocaleString()} unchanged skipped.`;
+      job.finishedAt = new Date().toISOString();
+    })
+    .catch((err) => {
+      job.status = 'error';
+      job.error = err instanceof Error ? err.message : 'TLO FTP synchronization failed';
+      job.phase = `Sync stopped: ${job.error}`;
+      job.finishedAt = new Date().toISOString();
+    });
+
+  return serializeJob(job);
+}
+
+export function getTloSyncJob(jobId: string): TloSyncJob | undefined {
+  const job = activeJobs.get(jobId);
+  return job ? serializeJob(job) : undefined;
+}
+
+export function getLatestRunningTloSyncJob(): TloSyncJob | undefined {
+  for (const id of jobOrder) {
+    const job = activeJobs.get(id);
+    if (job && (job.status === 'discovering' || job.status === 'syncing')) {
+      return serializeJob(job);
+    }
+  }
+  return undefined;
+}
+
+export function getLatestTloSyncJob(): TloSyncJob | undefined {
+  const running = getLatestRunningTloSyncJob();
+  if (running) return running;
+  const firstId = jobOrder[0];
+  if (!firstId) return undefined;
+  const job = activeJobs.get(firstId);
+  return job ? serializeJob(job) : undefined;
+}
+
+export function cancelTloSyncJob(jobId: string): TloSyncJob | undefined {
+  const job = activeJobs.get(jobId);
+  if (!job) return undefined;
+  job.cancelRequested = true;
+  if (job.status === 'discovering' || job.status === 'syncing') {
+    job.phase = 'Cancelling after in-flight FTP downloads finish…';
+  }
+  return serializeJob(job);
 }

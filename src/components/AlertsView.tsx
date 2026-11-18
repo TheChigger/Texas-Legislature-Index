@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { Bell, RefreshCw, Trash2, Check, Plus } from 'lucide-react';
+import { Bell, RefreshCw, Trash2, Check, Plus, FileSpreadsheet } from 'lucide-react';
 import type { AlertEvent, AlertRule } from '../types.ts';
+import { csvDateStamp, downloadCsv, stripHtmlTags } from '../utils/csv.ts';
 
 interface AlertsViewProps {
   onNewRule: () => void;
@@ -78,6 +79,29 @@ export const AlertsView: React.FC<AlertsViewProps> = ({
     onAlertsUpdated();
   };
 
+  const handleExportAlertsCsv = () => {
+    downloadCsv(
+      `texas-alert-dispatches-${csvDateStamp()}.csv`,
+      ['Status', 'Rule Name', 'Session', 'Bill Number', 'Bill Title', 'Match Type', 'Triggered At', 'Matched Snippet'],
+      events.map((ev) => [
+        ev.isRead ? 'Read' : 'Unread',
+        ev.ruleName,
+        ev.session,
+        ev.billNumber,
+        ev.billTitle,
+        ev.matchType,
+        ev.triggeredAt,
+        stripHtmlTags(ev.snippet),
+      ])
+    );
+  };
+
+  useEffect(() => {
+    const onExport = () => handleExportAlertsCsv();
+    window.addEventListener('capitol:export-csv', onExport);
+    return () => window.removeEventListener('capitol:export-csv', onExport);
+  }, [events]);
+
   return (
     <div className="space-y-6">
       <div className="border border-[#DFD9CE] bg-[#F4F0E8] p-4 flex flex-wrap items-center justify-between gap-4">
@@ -90,7 +114,17 @@ export const AlertsView: React.FC<AlertsViewProps> = ({
           </p>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={handleExportAlertsCsv}
+            disabled={events.length === 0}
+            className="px-3.5 py-2 text-xs font-medium bg-[#FFFFFF] border border-[#C5BDB0] hover:border-[#181715] disabled:opacity-50 rounded inline-flex items-center gap-1.5 cursor-pointer"
+            title="Export alert dispatches to CSV (Shortcut: e)"
+          >
+            <FileSpreadsheet className="w-3.5 h-3.5 text-[#14532D]" />
+            Export CSV
+          </button>
           <button
             type="button"
             onClick={handleRunScan}
@@ -104,6 +138,7 @@ export const AlertsView: React.FC<AlertsViewProps> = ({
             type="button"
             onClick={onNewRule}
             className="px-3.5 py-2 text-xs font-medium bg-[#9A3412] text-[#FBF9F5] hover:bg-[#7C2D12] rounded inline-flex items-center gap-1.5 cursor-pointer"
+            title="New Alert Rule (Shortcut: a)"
           >
             <Plus className="w-3.5 h-3.5" />
             New Alert Rule

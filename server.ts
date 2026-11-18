@@ -6,6 +6,7 @@ import { createServer as createViteServer } from 'vite';
 import { db, initSchema } from './src/server/db.ts';
 import { seedDatabaseIfEmpty } from './src/server/seed.ts';
 import { apiRouter } from './src/server/routes.ts';
+import { cancelTloSyncJob, getLatestRunningTloSyncJob } from './src/server/tloFtp.ts';
 
 async function startServer() {
   initSchema();
@@ -37,6 +38,8 @@ async function startServer() {
 
   const shutdown = () => {
     try {
+      const activeJob = getLatestRunningTloSyncJob();
+      if (activeJob) cancelTloSyncJob(activeJob.id);
       db.pragma('wal_checkpoint(TRUNCATE)');
       db.close();
     } catch {

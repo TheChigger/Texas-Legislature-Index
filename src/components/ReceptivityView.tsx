@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { MessageSquarePlus, Users, Scale, Building2 } from 'lucide-react';
+import { MessageSquarePlus, Users, Scale, Building2, FileSpreadsheet } from 'lucide-react';
 import type { BillSummary, PoliticianSummary, ReceptivityReport } from '../types.ts';
+import { csvDateStamp, downloadCsv } from '../utils/csv.ts';
 
 interface ReceptivityViewProps {
   onOpenBill: (billId: string) => void;
@@ -82,6 +83,127 @@ export const ReceptivityView: React.FC<ReceptivityViewProps> = ({
     }
   };
 
+  const handleExportReceptivityCsv = () => {
+    if (!report) return;
+    if (activeTab === 'committees') {
+      downloadCsv(
+        `texas-committee-receptivity-${csvDateStamp()}.csv`,
+        [
+          'Chamber',
+          'Committee',
+          'Chair',
+          'Referred Bills',
+          'Post-Hearing Rewrites',
+          'Citizen (Self) Witnesses',
+          'Organization Witnesses',
+          'Constituent Contacts',
+          'Observed Posture',
+          'Receptivity Score',
+        ],
+        report.committees.map((c) => [
+          c.chamber,
+          c.name,
+          c.chairName,
+          c.referredBills,
+          c.revisedAfterHearing,
+          c.citizenSelfWitnesses,
+          c.orgWitnesses,
+          c.constituentVolume,
+          c.postureLabel,
+          c.receptivityScore.toFixed(1),
+        ])
+      );
+    } else if (activeTab === 'representatives') {
+      downloadCsv(
+        `texas-representative-responsiveness-${csvDateStamp()}.csv`,
+        [
+          'Name',
+          'Party',
+          'District',
+          'Cross-Aisle Votes',
+          'Total Votes',
+          'Cross-Aisle %',
+          'Citizen Witnesses',
+          'Constituent Contacts',
+          'Top Donor Sector',
+          'Top Sector Share %',
+          'Signal',
+          'Responsiveness Index',
+        ],
+        report.representatives.map((r) => [
+          r.name,
+          r.party,
+          r.district,
+          r.crossAisleVotes,
+          r.totalVotes,
+          r.crossAislePct,
+          r.citizenWitnessExposure,
+          r.constituentContacts,
+          r.topDonorSector,
+          r.topSectorSharePct,
+          r.responsivenessSignal,
+          r.responsivenessScore.toFixed(1),
+        ])
+      );
+    } else if (activeTab === 'policies') {
+      downloadCsv(
+        `texas-policy-malleability-${csvDateStamp()}.csv`,
+        [
+          'Policy Domain',
+          'Malleability Posture',
+          'Bill Count',
+          'Amended Rate %',
+          'Witness For %',
+          'Witness Against %',
+          'Constituent Outreach Volume',
+        ],
+        report.policies.map((p) => [
+          p.domain,
+          p.malleabilityLabel,
+          p.billCount,
+          p.amendedRatePct,
+          p.citizenForPct,
+          p.citizenAgainstPct,
+          p.constituentVolume,
+        ])
+      );
+    } else {
+      downloadCsv(
+        `texas-constituent-logs-${csvDateStamp()}.csv`,
+        [
+          'Session',
+          'Bill Number',
+          'Channel',
+          'Stance',
+          'Volume',
+          'Committee',
+          'Target Office',
+          'Topic Keywords',
+          'Logged Date',
+          'Summary',
+        ],
+        report.recentCommunications.map((c) => [
+          c.session,
+          c.billNumber,
+          c.channel,
+          c.stance,
+          c.volumeCount,
+          c.committeeName,
+          c.politicianName ?? '',
+          c.topicKeywords,
+          c.loggedDate,
+          c.summary,
+        ])
+      );
+    }
+  };
+
+  useEffect(() => {
+    const onExport = () => handleExportReceptivityCsv();
+    window.addEventListener('capitol:export-csv', onExport);
+    return () => window.removeEventListener('capitol:export-csv', onExport);
+  }, [report, activeTab]);
+
   if (!report) {
     return (
       <div className="p-8 border border-[#DFD9CE] bg-[#FFFFFF] text-sm text-[#57534E]">
@@ -108,14 +230,25 @@ export const ReceptivityView: React.FC<ReceptivityViewProps> = ({
               Correlates TLO committee witness registrations (<span className="font-mono">witlistbill</span>), private citizen vs. organized lobby ratios, post-hearing bill rewrites, cross-aisle voting, and constituent outreach logs. Signals behavioral responsiveness deterministically without claiming causal intent.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => setShowForm((v) => !v)}
-            className="px-4 py-2 text-xs font-medium bg-[#9A3412] text-[#FBF9F5] rounded hover:bg-[#7C2D12] inline-flex items-center gap-1.5 cursor-pointer shrink-0 whitespace-nowrap"
-          >
-            <MessageSquarePlus className="w-3.5 h-3.5" />
-            Log Constituent Outreach
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={handleExportReceptivityCsv}
+              className="px-3.5 py-2 text-xs font-medium bg-[#FFFFFF] border border-[#C5BDB0] text-[#181715] rounded hover:border-[#181715] inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+              title="Export active receptivity table to CSV (Shortcut: e)"
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5 text-[#14532D]" />
+              Export CSV
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowForm((v) => !v)}
+              className="px-4 py-2 text-xs font-medium bg-[#9A3412] text-[#FBF9F5] rounded hover:bg-[#7C2D12] inline-flex items-center gap-1.5 cursor-pointer shrink-0 whitespace-nowrap"
+            >
+              <MessageSquarePlus className="w-3.5 h-3.5" />
+              Log Constituent Outreach
+            </button>
+          </div>
         </div>
 
         <div className="mt-5 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono tabular-nums">

@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { Search, Share2 } from 'lucide-react';
+import { Search, Share2, FileSpreadsheet } from 'lucide-react';
 import type { PoliticianDetail, PoliticianSummary } from '../types.ts';
+import { csvDateStamp, downloadCsv } from '../utils/csv.ts';
 
 interface PoliticiansViewProps {
   selectedPoliticianId: string;
@@ -51,6 +52,60 @@ export const PoliticiansView: React.FC<PoliticiansViewProps> = ({
       .finally(() => setLoading(false));
   }, [selectedPoliticianId]);
 
+  const handleExportPoliticiansCsv = () => {
+    downloadCsv(
+      `texas-legislators-${csvDateStamp()}.csv`,
+      [
+        'Name',
+        'Short Name',
+        'Party',
+        'Chamber',
+        'District',
+        'Leadership Role',
+        'Tenure (Years)',
+        'Total Raised ($)',
+        'Bills Authored',
+        'Bills Passed',
+        'Committees',
+        'Indexed Votes',
+      ],
+      politicians.map((p) => [
+        p.name,
+        p.shortName,
+        p.party,
+        p.chamber,
+        p.district,
+        p.leadershipRole,
+        p.tenureYears,
+        p.totalRaised,
+        p.billsAuthored,
+        p.billsPassed,
+        p.committeesCount,
+        p.votesCount,
+      ])
+    );
+  };
+
+  useEffect(() => {
+    const onExport = () => handleExportPoliticiansCsv();
+    const onStep = (ev: Event) => {
+      const delta = (ev as CustomEvent<{ delta?: number }>).detail?.delta ?? 1;
+      if (politicians.length === 0) return;
+      const curIdx = politicians.findIndex((p) => p.id === selectedPoliticianId);
+      const nextIdx =
+        curIdx === -1
+          ? 0
+          : Math.max(0, Math.min(politicians.length - 1, curIdx + delta));
+      if (politicians[nextIdx]) onSelectPolitician(politicians[nextIdx].id);
+    };
+    window.addEventListener('capitol:export-csv', onExport);
+    window.addEventListener('capitol:step-item', onStep);
+    return () => {
+      window.removeEventListener('capitol:export-csv', onExport);
+      window.removeEventListener('capitol:step-item', onStep);
+    };
+  }, [politicians, selectedPoliticianId]);
+
   return (
     <div className="space-y-6">
       <div className="border border-[#DFD9CE] bg-[#F4F0E8] p-4 flex flex-wrap items-center justify-between gap-3">
@@ -58,11 +113,17 @@ export const PoliticiansView: React.FC<PoliticiansViewProps> = ({
           <Search className="w-4 h-4 text-[#57534E] absolute left-3 top-1/2 -translate-y-1/2" />
           <input
             type="text"
+            data-global-search="true"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search Texas Senators & Representatives by name, district, or committee chair..."
-            className="w-full pl-9 pr-4 py-2 bg-[#FFFFFF] border border-[#C5BDB0] text-sm rounded"
+            className="w-full pl-9 pr-10 py-2 bg-[#FFFFFF] border border-[#C5BDB0] text-sm rounded"
           />
+          {!query && (
+            <kbd className="hidden sm:inline-block absolute right-3 top-1/2 -translate-y-1/2 px-1.5 py-0.5 text-[10px] font-mono text-[#78716C] bg-[#FBF9F5] border border-[#DFD9CE] rounded pointer-events-none">
+              /
+            </kbd>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -98,6 +159,16 @@ export const PoliticiansView: React.FC<PoliticiansViewProps> = ({
               </button>
             ))}
           </div>
+          <button
+            type="button"
+            onClick={handleExportPoliticiansCsv}
+            disabled={politicians.length === 0}
+            className="px-3 py-1.5 text-xs font-medium bg-[#FFFFFF] border border-[#C5BDB0] text-[#181715] rounded hover:border-[#181715] disabled:opacity-50 inline-flex items-center gap-1.5 cursor-pointer"
+            title="Export filtered legislators to CSV (Shortcut: e)"
+          >
+            <FileSpreadsheet className="w-3.5 h-3.5 text-[#14532D]" />
+            Export CSV
+          </button>
         </div>
       </div>
 

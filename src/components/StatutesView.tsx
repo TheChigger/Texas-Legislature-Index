@@ -1,11 +1,12 @@
 import React, { useEffect, useState } from 'react';
-import { Search, Download, History, BookOpen, RefreshCw, ArrowUpRight } from 'lucide-react';
+import { Search, Download, History, BookOpen, RefreshCw, ArrowUpRight, FileSpreadsheet } from 'lucide-react';
 import type {
   DiffLine,
   StatuteCodeInfo,
   StatuteSectionDetail,
   StatuteSectionSummary,
 } from '../types.ts';
+import { csvDateStamp, downloadCsv, stripHtmlTags } from '../utils/csv.ts';
 
 interface StatutesViewProps {
   onOpenBill: (billId: string) => void;
@@ -173,6 +174,56 @@ export const StatutesView: React.FC<StatutesViewProps> = ({
 
   const totalIndexedSections = codes.reduce((acc, c) => acc + c.sectionCount, 0);
 
+  const handleExportStatutesCsv = () => {
+    downloadCsv(
+      `texas-statutes-${codeFilter || 'all'}-${csvDateStamp()}.csv`,
+      [
+        'Code',
+        'Code Name',
+        'Chapter',
+        'Chapter Title',
+        'Section Number',
+        'Section Title',
+        'Last Amended Legislature',
+        'Sessions Amended',
+        'Acts History',
+        'Source',
+      ],
+      sections.map((s) => [
+        s.code,
+        s.codeName,
+        s.chapter,
+        s.chapterTitle,
+        s.sectionNumber,
+        s.sectionTitle,
+        s.lastAmendedSession,
+        s.sessionsAmended,
+        s.snippet ? stripHtmlTags(s.snippet) : s.actsHistory,
+        s.source,
+      ])
+    );
+  };
+
+  useEffect(() => {
+    const onExport = () => handleExportStatutesCsv();
+    const onStep = (ev: Event) => {
+      const delta = (ev as CustomEvent<{ delta?: number }>).detail?.delta ?? 1;
+      if (sections.length === 0) return;
+      const curIdx = sections.findIndex((s) => s.id === selectedId);
+      const nextIdx =
+        curIdx === -1
+          ? 0
+          : Math.max(0, Math.min(sections.length - 1, curIdx + delta));
+      if (sections[nextIdx]) setSelectedId(sections[nextIdx].id);
+    };
+    window.addEventListener('capitol:export-csv', onExport);
+    window.addEventListener('capitol:step-item', onStep);
+    return () => {
+      window.removeEventListener('capitol:export-csv', onExport);
+      window.removeEventListener('capitol:step-item', onStep);
+    };
+  }, [sections, selectedId, codeFilter]);
+
   return (
     <div className="space-y-6">
       {/* Code Archive Sync Masthead */}
@@ -240,11 +291,17 @@ export const StatutesView: React.FC<StatutesViewProps> = ({
           <Search className="w-4 h-4 text-[#57534E] absolute left-3 top-1/2 -translate-y-1/2" />
           <input
             type="text"
+            data-global-search="true"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder='Search Texas statutes, section numbers, & Acts lineage (e.g. "basic allotment" OR homestead OR 12.01)...'
-            className="w-full pl-9 pr-4 py-2 text-sm bg-[#FFFFFF] border border-[#C5BDB0] rounded"
+            className="w-full pl-9 pr-10 py-2 text-sm bg-[#FFFFFF] border border-[#C5BDB0] rounded"
           />
+          {!query && (
+            <kbd className="hidden sm:inline-block absolute right-3 top-1/2 -translate-y-1/2 px-1.5 py-0.5 text-[10px] font-mono text-[#78716C] bg-[#FBF9F5] border border-[#DFD9CE] rounded pointer-events-none">
+              /
+            </kbd>
+          )}
         </div>
 
         <select
@@ -267,6 +324,17 @@ export const StatutesView: React.FC<StatutesViewProps> = ({
           placeholder="Amended Leg. (e.g. 88th, 73rd)"
           className="px-3 py-2 text-xs font-mono bg-[#FFFFFF] border border-[#C5BDB0] rounded w-48"
         />
+
+        <button
+          type="button"
+          onClick={handleExportStatutesCsv}
+          disabled={sections.length === 0}
+          className="px-3 py-2 text-xs font-medium bg-[#FFFFFF] border border-[#C5BDB0] text-[#181715] rounded hover:border-[#181715] disabled:opacity-50 inline-flex items-center gap-1.5 cursor-pointer"
+          title="Export matching statutory sections to CSV (Shortcut: e)"
+        >
+          <FileSpreadsheet className="w-3.5 h-3.5 text-[#14532D]" />
+          Export CSV
+        </button>
       </div>
 
       {/* Two-Column Split: Section Index + Section History Dossier */}
