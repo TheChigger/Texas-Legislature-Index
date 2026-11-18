@@ -1,0 +1,6 @@
+{
+  "name": "Texas Capitol Ledger",
+  "description": "Deterministic SQLite keyword database, influential legislation tracker, amendment archive, politician dossiers, automated alerts, and network explorer for the Texas State Legislature.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

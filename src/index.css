@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Roboto", system-ui, -apple-system, sans-serif;
+  --font-display: "Roboto Slab", "Roboto", Georgia, serif;
+  --font-condensed: "Roboto Condensed", "Roboto", sans-serif;
+  --font-mono: "Roboto Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-canvas: #FBF9F5;
+  --color-surface: #F4F0E8;
+  --color-surface-raised: #FFFFFF;
+  --color-ink: #181715;
+  --color-ink-muted: #57534E;
+  --color-ink-subtle: #78716C;
+  --color-rule: #DFD9CE;
+  --color-rule-strong: #C5BDB0;
+  --color-accent: #9A3412;
+  --color-accent-hover: #7C2D12;
+  --color-lapis: #1E3A5F;
+  --color-forest: #14532D;
+  --color-crimson: #991B1B;
+  --color-amber-ink: #92400E;
+}
+
+@layer base {
+  html, body {
+    background-color: #FBF9F5;
+    color: #181715;
+    font-family: "Roboto", system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  h1, h2, .font-display {
+    font-family: "Roboto Slab", "Roboto", Georgia, serif;
+    text-wrap: balance;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+mark.fts-hit {
+  background-color: #FDE68A;
+  color: #181715;
+  padding: 0 2px;
+  border-radius: 2px;
+  font-weight: 500;
+}
+
