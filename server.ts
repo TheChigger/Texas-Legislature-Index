@@ -3,7 +3,7 @@ import http from 'http';
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
-import { initSchema } from './src/server/db.ts';
+import { db, initSchema } from './src/server/db.ts';
 import { seedDatabaseIfEmpty } from './src/server/seed.ts';
 import { apiRouter } from './src/server/routes.ts';
 
@@ -34,6 +34,20 @@ async function startServer() {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }
+
+  const shutdown = () => {
+    try {
+      db.pragma('wal_checkpoint(TRUNCATE)');
+      db.close();
+    } catch {
+      // Ignore shutdown close errors
+    }
+    httpServer.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1000).unref();
+  };
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Texas Capitol Ledger listening on http://localhost:${PORT}`);

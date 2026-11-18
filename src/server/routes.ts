@@ -55,38 +55,44 @@ interface RawBillRow {
   rank?: number;
 }
 
+function safeStr(v: unknown, fallback = ''): string {
+  if (typeof v === 'string') return v;
+  if (Buffer.isBuffer(v)) return fallback;
+  return v == null ? fallback : String(v);
+}
+
 function mapBillRow(row: RawBillRow): BillSummary {
   const linkCountRow = db
     .prepare(`SELECT COUNT(*) AS c FROM bill_links WHERE source_bill_id = ? OR target_bill_id = ?`)
     .get(row.id, row.id) as { c: number };
 
   return {
-    id: row.id,
-    session: row.session,
-    billNumber: row.bill_number,
-    chamber: row.chamber,
-    title: row.title,
-    summary: row.summary,
-    statuteCodes: JSON.parse(row.statute_codes || '[]'),
-    status: row.status,
+    id: safeStr(row.id),
+    session: safeStr(row.session),
+    billNumber: safeStr(row.bill_number),
+    chamber: (safeStr(row.chamber, 'House') as Chamber),
+    title: safeStr(row.title),
+    summary: safeStr(row.summary),
+    statuteCodes: JSON.parse(safeStr(row.statute_codes, '[]')),
+    status: safeStr(row.status),
     stage: row.stage,
-    primaryAuthor: row.primary_author,
-    coauthors: JSON.parse(row.coauthors_json || '[]'),
-    sponsors: JSON.parse(row.sponsors_json || '[]'),
-    cosponsors: JSON.parse(row.cosponsors_json || '[]'),
-    committees: JSON.parse(row.committees_json || '[]'),
-    subjects: JSON.parse(row.subjects_json || '[]'),
-    lastAction: row.last_action,
-    lastActionDate: row.last_action_date,
-    filedDate: row.filed_date,
-    influenceScore: row.influence_score,
-    influenceBreakdown: JSON.parse(row.influence_breakdown_json || '{}'),
-    momentumLabel: row.momentum_label,
-    bipartisanIndex: row.bipartisan_index,
-    amendmentCount: row.amendment_count,
-    actionCount: row.action_count,
+    primaryAuthor: safeStr(row.primary_author),
+    coauthors: JSON.parse(safeStr(row.coauthors_json, '[]')),
+    sponsors: JSON.parse(safeStr(row.sponsors_json, '[]')),
+    cosponsors: JSON.parse(safeStr(row.cosponsors_json, '[]')),
+    committees: JSON.parse(safeStr(row.committees_json, '[]')),
+    subjects: JSON.parse(safeStr(row.subjects_json, '[]')),
+    lastAction: safeStr(row.last_action),
+    lastActionDate: safeStr(row.last_action_date),
+    filedDate: safeStr(row.filed_date),
+    influenceScore: Number(row.influence_score) || 0,
+    influenceBreakdown: JSON.parse(safeStr(row.influence_breakdown_json, '{}')),
+    momentumLabel: safeStr(row.momentum_label),
+    bipartisanIndex: Number(row.bipartisan_index) || 0,
+    amendmentCount: Number(row.amendment_count) || 0,
+    actionCount: Number(row.action_count) || 0,
     linkCount: linkCountRow.c,
-    source: row.source,
+    source: safeStr(row.source),
     snippet: row.snippet,
     rank: row.rank,
   };
@@ -280,7 +286,7 @@ apiRouter.get('/bills', (req, res) => {
   const committee = String(req.query.committee ?? '').trim();
   const sort = String(req.query.sort ?? 'influence').trim();
 
-  const where: string[] = [];
+  const where: string[] = ["b.id IS NOT NULL AND typeof(b.id) = 'text' AND typeof(b.session) = 'text'"];
   const params: Array<string | number> = [];
 
   if (session) {

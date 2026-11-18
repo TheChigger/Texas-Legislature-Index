@@ -13,6 +13,8 @@ export const db = new Database(DB_PATH);
 
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous = NORMAL');
+db.pragma('busy_timeout = 5000');
+db.pragma('wal_autocheckpoint = 100');
 db.pragma('cache_size = -65536');
 db.pragma('temp_store = MEMORY');
 db.pragma('mmap_size = 268435456');
