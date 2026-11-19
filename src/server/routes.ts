@@ -517,6 +517,10 @@ apiRouter.get('/bills/:id', (req, res) => {
     )
     .all(row.id) as BillDocument[];
 
+  const savedBrief = db
+    .prepare(`SELECT brief, model, updated_at AS updatedAt FROM bill_ai_briefs WHERE bill_id = ?`)
+    .get(row.id) as { brief: string; model: string; updatedAt: string } | undefined;
+
   res.json({
     ...bill,
     fullText: row.full_text,
@@ -532,6 +536,9 @@ apiRouter.get('/bills/:id', (req, res) => {
     constituentLogs,
     publicSentiment,
     documents,
+    aiBrief: savedBrief?.brief || '',
+    aiBriefModel: savedBrief?.model || '',
+    aiBriefUpdatedAt: savedBrief?.updatedAt || '',
   });
 });
 
@@ -1964,8 +1971,24 @@ apiRouter.post('/bills/:id/ai-brief', async (req, res) => {
     const data = (await llmRes.json()) as {
       choices?: Array<{ message?: { content?: string } }>;
     };
-    const brief = data.choices?.[0]?.message?.content?.trim() || 'No brief returned.';
-    res.json({ brief, model });
+    const brief = data.choices?.[0]?.message?.content?.trim() || '';
+    if (!brief) {
+      return res.status(502).json({
+        error: `Local LLM (${model}) returned an empty brief.`,
+      });
+    }
+
+    const updatedAt = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO bill_ai_briefs (bill_id, brief, model, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(bill_id) DO UPDATE SET
+         brief = excluded.brief,
+         model = excluded.model,
+         updated_at = excluded.updated_at`
+    ).run(row.id, brief, model, updatedAt);
+
+    res.json({ brief, model, updatedAt });
   } catch (err) {
     res.status(502).json({
       error:

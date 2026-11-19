@@ -181,6 +181,9 @@ export interface BillDetail extends BillSummary {
   constituentLogs: ConstituentCommunication[];
   publicSentiment: PublicSentimentSummary;
   documents?: BillDocument[];
+  aiBrief?: string;
+  aiBriefModel?: string;
+  aiBriefUpdatedAt?: string;
 }
 
 export interface DiffLine {

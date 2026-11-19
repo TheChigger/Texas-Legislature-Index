@@ -328,6 +328,13 @@ export function initSchema(): void {
     );
 
     CREATE INDEX IF NOT EXISTS idx_bill_docs_bill ON bill_documents(bill_id);
+
+    CREATE TABLE IF NOT EXISTS bill_ai_briefs (
+      bill_id TEXT PRIMARY KEY,
+      brief TEXT NOT NULL,
+      model TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL
+    );
   `);
 
   cleanExistingIndexedHtml();

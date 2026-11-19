@@ -11,6 +11,7 @@ import {
   ChevronDown,
   ChevronUp,
   Sparkles,
+  RefreshCw,
   FileSpreadsheet,
 } from 'lucide-react';
 import type {
@@ -87,9 +88,11 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
   const [amFullText, setAmFullText] = useState('');
   const [savingAmend, setSavingAmend] = useState(false);
 
-  // Optional secondary AI brief state (collapsed by default, never primary)
+  // Saved / on-demand local LLM AI brief state
   const [showAiDrawer, setShowAiDrawer] = useState(false);
   const [aiBrief, setAiBrief] = useState<string>('');
+  const [aiBriefModel, setAiBriefModel] = useState<string>('');
+  const [aiBriefUpdatedAt, setAiBriefUpdatedAt] = useState<string>('');
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState('');
 
@@ -132,11 +135,21 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
     }
     setLoadingDetail(true);
     setAiBrief('');
+    setAiBriefModel('');
+    setAiBriefUpdatedAt('');
     setAiError('');
     setShowAiDrawer(false);
     fetch(`/api/bills/${encodeURIComponent(billId)}`)
       .then((r) => r.json())
-      .then((data: BillDetail) => setDetail(data))
+      .then((data: BillDetail) => {
+        setDetail(data);
+        if (data.aiBrief) {
+          setAiBrief(data.aiBrief);
+          setAiBriefModel(data.aiBriefModel || '');
+          setAiBriefUpdatedAt(data.aiBriefUpdatedAt || '');
+          setShowAiDrawer(true);
+        }
+      })
       .catch(() => setDetail(null))
       .finally(() => setLoadingDetail(false));
   };
@@ -216,6 +229,7 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
     if (!detail) return;
     setAiLoading(true);
     setAiError('');
+    setShowAiDrawer(true);
     try {
       const res = await fetch(`/api/bills/${encodeURIComponent(detail.id)}/ai-brief`, {
         method: 'POST',
@@ -223,6 +237,18 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Could not generate AI brief');
       setAiBrief(data.brief);
+      setAiBriefModel(data.model || '');
+      setAiBriefUpdatedAt(data.updatedAt || new Date().toISOString());
+      setDetail((prev) =>
+        prev && prev.id === detail.id
+          ? {
+              ...prev,
+              aiBrief: data.brief,
+              aiBriefModel: data.model || '',
+              aiBriefUpdatedAt: data.updatedAt || new Date().toISOString(),
+            }
+          : prev
+      );
     } catch (err) {
       setAiError(err instanceof Error ? err.message : 'AI brief failed');
     } finally {
@@ -773,6 +799,67 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
                   <span>Status: {detail.status}</span>
                 </div>
 
+                {/* Top AI Policy Brief Panel (Saved with Bill in SQLite) */}
+                <div className="mt-4 p-3.5 bg-[#FFFFFF] border border-[#DFD9CE]">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <span className="inline-flex items-center gap-1.5 font-medium text-[#181715]">
+                        <Sparkles className="w-3.5 h-3.5 text-[#9A3412]" />
+                        AI Clerk Policy Brief
+                      </span>
+                      {aiBrief ? (
+                        <span className="font-mono text-[11px] text-[#14532D]">
+                          Saved
+                          {aiBriefModel ? ` · ${aiBriefModel}` : ''}
+                          {aiBriefUpdatedAt ? ` · ${aiBriefUpdatedAt.slice(0, 10)}` : ''}
+                        </span>
+                      ) : (
+                        <span className="text-[#78716C]">
+                          Generate &amp; save a 3-bullet summary grounded in indexed bill text
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {aiBrief && (
+                        <button
+                          type="button"
+                          onClick={() => setShowAiDrawer((v) => !v)}
+                          className="px-2 py-1 text-[11px] font-medium text-[#57534E] hover:text-[#181715] inline-flex items-center gap-1 cursor-pointer"
+                        >
+                          {showAiDrawer ? (
+                            <>
+                              Hide <ChevronUp className="w-3.5 h-3.5" />
+                            </>
+                          ) : (
+                            <>
+                              Show <ChevronDown className="w-3.5 h-3.5" />
+                            </>
+                          )}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={handleGenerateOptionalAiBrief}
+                        disabled={aiLoading}
+                        className="px-3 py-1.5 text-xs font-medium bg-[#181715] text-[#FBF9F5] hover:bg-[#9A3412] disabled:opacity-60 rounded inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${aiLoading ? 'animate-spin' : ''}`} />
+                        {aiLoading
+                          ? 'Generating Brief…'
+                          : aiBrief
+                            ? 'Regenerate Brief'
+                            : 'Generate AI Brief'}
+                      </button>
+                    </div>
+                  </div>
+                  {aiError && <p className="text-xs text-[#991B1B] mt-2">{aiError}</p>}
+                  {aiBrief && showAiDrawer && (
+                    <div className="text-xs text-[#181715] whitespace-pre-wrap leading-relaxed mt-3 pt-3 border-t border-[#DFD9CE]">
+                      {aiBrief}
+                    </div>
+                  )}
+                </div>
+
                 {/* Dossier Sub-Tabs */}
                 <div className="mt-5 flex items-center gap-6 border-t border-[#DFD9CE] pt-3 overflow-x-auto">
                   {[
@@ -926,44 +1013,6 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
                           {[...detail.coauthors, ...detail.cosponsors].join(' · ') || 'None recorded'}
                         </p>
                       </div>
-                    </div>
-
-                    {/* Quiet Secondary Optional AI Policy Brief */}
-                    <div className="border-t border-[#DFD9CE] pt-4">
-                      <button
-                        type="button"
-                        onClick={() => setShowAiDrawer((v) => !v)}
-                        className="w-full flex items-center justify-between text-xs text-[#78716C] hover:text-[#181715] cursor-pointer"
-                      >
-                        <span className="inline-flex items-center gap-1.5">
-                          <Sparkles className="w-3.5 h-3.5" />
-                          Optional Secondary Tool: Generate 3-Bullet AI Clerk Brief
-                        </span>
-                        {showAiDrawer ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                      </button>
-                      {showAiDrawer && (
-                        <div className="mt-3 p-4 bg-[#FBF9F5] border border-[#DFD9CE] space-y-2">
-                          <div className="flex items-center justify-between gap-3">
-                            <span className="text-xs text-[#57534E]">
-                              Secondary synthesis strictly from the indexed bill text above.
-                            </span>
-                            <button
-                              type="button"
-                              onClick={handleGenerateOptionalAiBrief}
-                              disabled={aiLoading}
-                              className="px-3 py-1.5 text-xs font-medium border border-[#C5BDB0] bg-[#FFFFFF] hover:border-[#181715] rounded cursor-pointer"
-                            >
-                              {aiLoading ? 'Synthesizing...' : 'Generate Brief'}
-                            </button>
-                          </div>
-                          {aiError && <p className="text-xs text-[#991B1B]">{aiError}</p>}
-                          {aiBrief && (
-                            <div className="text-xs text-[#181715] whitespace-pre-wrap leading-relaxed pt-2 border-t border-[#DFD9CE]">
-                              {aiBrief}
-                            </div>
-                          )}
-                        </div>
-                      )}
                     </div>
                   </>
                 )}
