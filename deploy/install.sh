@@ -17,7 +17,9 @@ fi
 APP_DIR="${APP_DIR:-$DEFAULT_APP_DIR}"
 PORT="${PORT:-3089}"
 IMAGE="${IMAGE:-}"
-GEMINI_API_KEY="${GEMINI_API_KEY:-}"
+LOCAL_LLM_URL="${LOCAL_LLM_URL:-http://192.168.4.20:11434/v1/}"
+LOCAL_LLM_MODEL="${LOCAL_LLM_MODEL:-qwen2.5:7b}"
+LOCAL_LLM_API_KEY="${LOCAL_LLM_API_KEY:-}"
 EXISTING_DB="${EXISTING_DB:-}"
 
 echo "=== Texas Capitol Ledger — Docker Installer ==="
@@ -39,9 +41,11 @@ if [ -t 0 ]; then
   read -r -p "Host port [$PORT]: " INPUT_PORT
   PORT="${INPUT_PORT:-$PORT}"
 
-  if [ -z "$GEMINI_API_KEY" ]; then
-    read -r -p "Optional GEMINI_API_KEY (press Enter to skip): " GEMINI_API_KEY
-  fi
+  read -r -p "Local LLM API base [$LOCAL_LLM_URL]: " INPUT_LLM_URL
+  LOCAL_LLM_URL="${INPUT_LLM_URL:-$LOCAL_LLM_URL}"
+
+  read -r -p "Local LLM model [$LOCAL_LLM_MODEL]: " INPUT_LLM_MODEL
+  LOCAL_LLM_MODEL="${INPUT_LLM_MODEL:-$LOCAL_LLM_MODEL}"
 
   if [ ! -f "$APP_DIR/data/capitol_ledger.db" ] && [ -z "$EXISTING_DB" ]; then
     read -r -p "Optional path to an existing capitol_ledger.db to import (press Enter to skip): " EXISTING_DB
@@ -66,7 +70,9 @@ cat > "$APP_DIR/.env" <<EOF
 CAPITOL_IMAGE=$IMAGE
 CAPITOL_PORT=$PORT
 CAPITOL_DATA_DIR=$APP_DIR/data
-GEMINI_API_KEY=$GEMINI_API_KEY
+LOCAL_LLM_URL=$LOCAL_LLM_URL
+LOCAL_LLM_MODEL=$LOCAL_LLM_MODEL
+LOCAL_LLM_API_KEY=$LOCAL_LLM_API_KEY
 EOF
 chmod 600 "$APP_DIR/.env"
 
@@ -84,7 +90,11 @@ services:
       CAPITOL_PORT: "3089"
       CAPITOL_DB_PATH: /app/data/capitol_ledger.db
       SKIP_SEED_ON_EXISTING_DB: "true"
-      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      LOCAL_LLM_URL: "${LOCAL_LLM_URL:-http://192.168.4.20:11434/v1/}"
+      LOCAL_LLM_MODEL: "${LOCAL_LLM_MODEL:-qwen2.5:7b}"
+      LOCAL_LLM_API_KEY: "${LOCAL_LLM_API_KEY:-}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/app/data
 EOF

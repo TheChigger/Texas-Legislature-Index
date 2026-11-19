@@ -13,7 +13,11 @@ services:
       CAPITOL_PORT: "3089"
       CAPITOL_DB_PATH: /app/data/capitol_ledger.db
       SKIP_SEED_ON_EXISTING_DB: "true"
-      GEMINI_API_KEY: ""
+      LOCAL_LLM_URL: "http://192.168.4.20:11434/v1/"
+      LOCAL_LLM_MODEL: "qwen2.5:7b"
+      LOCAL_LLM_API_KEY: ""
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - type: bind
         source: /DATA/AppData/texas-capitol-ledger/data

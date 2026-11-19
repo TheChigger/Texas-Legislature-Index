@@ -1,5 +1,4 @@
 import { Router } from 'express';
-import { GoogleGenAI } from '@google/genai';
 import {
   buildSafeFtsQuery,
   db,
@@ -1889,12 +1888,16 @@ apiRouter.post('/tlo/sync-cancel/:jobId', (req, res) => {
   res.json({ job });
 });
 
-// 11. Optional Secondary AI Brief (Explicitly Secondary to Deterministic Keyword Database)
+// 11. Optional Secondary AI Brief via Local OpenAI-Compatible LLM (Ollama / llama.cpp / vLLM)
 apiRouter.post('/bills/:id/ai-brief', async (req, res) => {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
+  const rawBaseUrl = (process.env.LOCAL_LLM_URL || 'http://192.168.4.20:11434/v1/').trim();
+  const baseUrl = rawBaseUrl.replace(/\/+$/, '');
+  const model = (process.env.LOCAL_LLM_MODEL || 'qwen2.5:7b').trim();
+  const apiKey = (process.env.LOCAL_LLM_API_KEY || '').trim();
+
+  if (!baseUrl) {
     return res.status(400).json({
-      error: 'GEMINI_API_KEY is not configured in Secrets. Use the deterministic SQLite keyword dossier and statutory diff above.',
+      error: 'LOCAL_LLM_URL is not configured. Set LOCAL_LLM_URL and LOCAL_LLM_MODEL in your environment.',
     });
   }
 
@@ -1906,15 +1909,6 @@ apiRouter.post('/bills/:id/ai-brief', async (req, res) => {
     .all(row.id) as Array<{ version_label: string; disposition: string; summary: string }>;
 
   try {
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
-
     const prompt = [
       `Summarize this Texas Legislature bill concisely in 3 bullet points (Policy Mechanism, Fiscal/Committee Posture, Amendment Evolution).`,
       `Bill: ${row.session} ${row.bill_number} — ${row.title}`,
@@ -1924,21 +1918,60 @@ apiRouter.post('/bills/:id/ai-brief', async (req, res) => {
       amendments.length
         ? `Amendments: ${amendments.map((a) => `${a.version_label} (${a.disposition}): ${a.summary}`).join(' | ')}`
         : '',
-    ].join('\n');
+    ]
+      .filter(Boolean)
+      .join('\n');
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: prompt,
-      config: {
-        systemInstruction:
-          'You are a neutral Texas legislative clerk. Provide an objective, concise 3-bullet policy brief grounded strictly in the provided statutory text.',
-      },
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (apiKey) {
+      headers.Authorization = `Bearer ${apiKey}`;
+    }
+
+    const endpoint = baseUrl.endsWith('/chat/completions')
+      ? baseUrl
+      : `${baseUrl}/chat/completions`;
+
+    const llmRes = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      signal: AbortSignal.timeout(90000),
+      body: JSON.stringify({
+        model,
+        temperature: 0.2,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are a neutral Texas legislative clerk. Provide an objective, concise 3-bullet policy brief grounded strictly in the provided statutory text.',
+          },
+          {
+            role: 'user',
+            content: prompt,
+          },
+        ],
+      }),
     });
 
-    res.json({ brief: response.text ?? 'No brief returned.' });
+    if (!llmRes.ok) {
+      const errBody = await llmRes.text().catch(() => '');
+      return res.status(502).json({
+        error: `Local LLM (${model} at ${endpoint}) returned HTTP ${llmRes.status}${errBody ? `: ${errBody.slice(0, 240)}` : ''}`,
+      });
+    }
+
+    const data = (await llmRes.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const brief = data.choices?.[0]?.message?.content?.trim() || 'No brief returned.';
+    res.json({ brief, model });
   } catch (err) {
     res.status(502).json({
-      error: err instanceof Error ? err.message : 'AI brief generation failed',
+      error:
+        err instanceof Error
+          ? `Could not reach local LLM at ${baseUrl} (${model}): ${err.message}`
+          : 'Local LLM brief generation failed',
     });
   }
 });
