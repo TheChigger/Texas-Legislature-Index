@@ -40,6 +40,19 @@ import type {
 
 export const apiRouter = Router();
 
+apiRouter.get('/health', (_req, res) => {
+  try {
+    db.prepare('SELECT 1 AS ok').get();
+    res.json({ ok: true, status: 'healthy', timestamp: new Date().toISOString() });
+  } catch (err) {
+    res.status(503).json({
+      ok: false,
+      status: 'unhealthy',
+      error: err instanceof Error ? err.message : 'Database check failed',
+    });
+  }
+});
+
 interface RawBillRow {
   id: string;
   session: string;

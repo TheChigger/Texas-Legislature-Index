@@ -20,4 +20,7 @@ ENV SKIP_SEED_ON_EXISTING_DB=true
 
 EXPOSE 3089
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:' + (process.env.CAPITOL_PORT || 3089) + '/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+
 CMD ["npm", "start"]
