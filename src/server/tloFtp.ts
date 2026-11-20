@@ -236,8 +236,23 @@ function htmlToPlainText(html: string): string {
 
 function inferStageFromTlo(lastAction: string, committees: Array<{ status: string }>): BillStage {
   const lower = lastAction.toLowerCase();
-  if (lower.includes('signed by the governor') || lower.includes('effective')) return 'Signed';
-  if (lower.includes('vetoed')) return 'Vetoed';
+  if (
+    lower.includes('vetoed') &&
+    !lower.includes('signed by the governor') &&
+    !lower.includes('line-item veto')
+  ) {
+    return 'Vetoed';
+  }
+  if (
+    lower.includes('signed by the governor') ||
+    lower.includes('filed without the governor') ||
+    lower.includes('filed with the secretary of state') ||
+    lower.includes('effective on') ||
+    lower.includes('effective immediately') ||
+    lower.includes('became law')
+  ) {
+    return 'Signed';
+  }
   if (lower.includes('enrolled')) return 'Enrolled';
   if (lower.includes('engrossed') || lower.includes('passed to third reading') || lower.includes('passed')) {
     return 'Engrossed';

@@ -16,11 +16,13 @@ import {
 } from 'lucide-react';
 import type {
   BillDetail,
+  BillOutcome,
   BillSummary,
   LinkType,
   OverviewResponse,
 } from '../types.ts';
 import { RedlineDiffPane } from './RedlineDiffPane.tsx';
+import { OutcomeIndicator } from './OutcomeIndicator.tsx';
 import { csvDateStamp, downloadCsv } from '../utils/csv.ts';
 
 interface LegislationViewProps {
@@ -60,9 +62,17 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
   const [query, setQuery] = useState('');
   const [chamber, setChamber] = useState('');
   const [stage, setStage] = useState('');
+  const [outcome, setOutcome] = useState<'' | BillOutcome>('');
   const [sort, setSort] = useState<'influence' | 'relevance' | 'amendments' | 'recent'>('influence');
 
   const [bills, setBills] = useState<BillSummary[]>([]);
+  const [outcomeSummary, setOutcomeSummary] = useState<{
+    passed: number;
+    failed: number;
+    vetoed: number;
+    active: number;
+    totalPrevious: number;
+  } | null>(null);
   const [loadingList, setLoadingList] = useState(false);
 
   const [detail, setDetail] = useState<BillDetail | null>(null);
@@ -106,6 +116,7 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
       if (activeSession) params.set('session', activeSession);
       if (chamber) params.set('chamber', chamber);
       if (stage) params.set('stage', stage);
+      if (outcome) params.set('outcome', outcome);
       params.set('sort', query.trim() && sort === 'influence' ? 'relevance' : sort);
 
       fetch(`/api/bills?${params.toString()}`, { signal: controller.signal })
@@ -113,6 +124,7 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
         .then((data) => {
           const list: BillSummary[] = data.bills ?? [];
           setBills(list);
+          setOutcomeSummary(data.outcomeSummary ?? null);
           if (list.length > 0 && (!selectedBillId || !list.some((b) => b.id === selectedBillId))) {
             onSelectBill(list[0].id);
           }
@@ -125,7 +137,7 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
       clearTimeout(timer);
       controller.abort();
     };
-  }, [query, activeSession, chamber, stage, sort, refreshSignal]);
+  }, [query, activeSession, chamber, stage, outcome, sort, refreshSignal]);
 
   // Fetch active bill dossier
   const loadBillDetail = (billId: string) => {
@@ -268,6 +280,7 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
         if (activeSession) params.set('session', activeSession);
         if (chamber) params.set('chamber', chamber);
         if (stage) params.set('stage', stage);
+        if (outcome) params.set('outcome', outcome);
         params.set('sort', query.trim() && sort === 'influence' ? 'relevance' : sort);
         params.set('limit', '10000');
         const res = await fetch(`/api/bills?${params.toString()}`);
@@ -284,6 +297,8 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
           'Bill Number',
           'Chamber',
           'Stage',
+          'Outcome',
+          'Outcome Detail',
           'Title',
           'Primary Author',
           'Co-Authors',
@@ -306,6 +321,8 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
           b.billNumber,
           b.chamber,
           b.stage,
+          b.outcome,
+          b.outcomeDetail,
           b.title,
           b.primaryAuthor,
           b.coauthors,
@@ -385,7 +402,7 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
       window.removeEventListener('capitol:export-csv', onExport);
       window.removeEventListener('capitol:step-item', onStep);
     };
-  }, [bills, selectedBillId, detail, query, activeSession, chamber, stage, sort]);
+  }, [bills, selectedBillId, detail, query, activeSession, chamber, stage, outcome, sort]);
 
   return (
     <div className="space-y-6">
@@ -486,15 +503,20 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
                   }`}
                 >
                   <div className="min-w-0">
-                    <div className="flex items-center gap-2 text-xs font-mono text-[#57534E]">
+                    <div className="flex flex-wrap items-center gap-1.5 text-xs font-mono text-[#57534E]">
                       <span className="text-[#9A3412] font-semibold tabular-nums">
                         0{idx + 1}.
                       </span>
                       <span className="font-semibold text-[#181715]">
                         {ib.session} {ib.billNumber}
                       </span>
-                      <span aria-hidden="true">·</span>
-                      <span>{ib.stage}</span>
+                      <OutcomeIndicator outcome={ib.outcome} detail={ib.outcomeDetail} />
+                      {ib.outcome === 'Active' && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span>{ib.stage}</span>
+                        </>
+                      )}
                       <span aria-hidden="true">·</span>
                       <span>{ib.primaryAuthor}</span>
                     </div>
@@ -609,6 +631,19 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
             </select>
 
             <select
+              value={outcome}
+              onChange={(e) => setOutcome(e.target.value as '' | BillOutcome)}
+              aria-label="Filter by bill outcome"
+              className="px-3 py-1.5 text-xs bg-[#FFFFFF] border border-[#C5BDB0] text-[#181715] rounded"
+            >
+              <option value="">All Outcomes</option>
+              <option value="Passed">Passed (Previous)</option>
+              <option value="Failed">Failed (Previous)</option>
+              <option value="Vetoed">Vetoed (Previous)</option>
+              <option value="Active">In Progress (90th)</option>
+            </select>
+
+            <select
               value={sort}
               onChange={(e) => setSort(e.target.value as typeof sort)}
               className="px-3 py-1.5 text-xs bg-[#FFFFFF] border border-[#C5BDB0] text-[#181715] rounded"
@@ -637,18 +672,100 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
       </section>
 
       {/* Section 3: Two-Column Research Split (Bill Index + Broadsheet Dossier) */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* Left 5 cols: Ranked Bill Ledger */}
-        <div className="lg:col-span-5 border border-[#DFD9CE] bg-[#FFFFFF]">
-          <div className="px-4 py-3 border-b border-[#DFD9CE] bg-[#F4F0E8] flex items-center justify-between text-xs font-medium text-[#57534E]">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 lg:items-stretch">
+        {/* Left 5 cols: Ranked Bill Ledger (matches right dossier height on desktop) */}
+        <div className="lg:col-span-5 lg:relative">
+          <div className="border border-[#DFD9CE] bg-[#FFFFFF] flex flex-col lg:absolute lg:inset-0">
+          <div className="px-4 py-3 border-b border-[#DFD9CE] bg-[#F4F0E8] flex items-center justify-between text-xs font-medium text-[#57534E] shrink-0">
             <span className="font-mono tabular-nums">
               {loadingList ? 'Querying FTS5 index...' : `${bills.length} matching bills`}
             </span>
             <span>Click record to open dossier</span>
           </div>
 
+          {outcomeSummary && outcomeSummary.totalPrevious > 0 && (() => {
+            const totalPrev = outcomeSummary.totalPrevious;
+            const passedPct = Math.round((outcomeSummary.passed / totalPrev) * 100);
+            const failedPct = Math.round((outcomeSummary.failed / totalPrev) * 100);
+            const vetoedPct = Math.round((outcomeSummary.vetoed / totalPrev) * 100);
+            return (
+              <div className="px-4 py-2.5 border-b border-[#DFD9CE] bg-[#FBF9F5] space-y-1.5 shrink-0">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono tabular-nums">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-[#78716C] uppercase text-[10px]">Prior Sessions:</span>
+                    <button
+                      type="button"
+                      onClick={() => setOutcome((prev) => (prev === 'Passed' ? '' : 'Passed'))}
+                      className={`cursor-pointer hover:underline ${
+                        outcome === 'Passed' ? 'font-bold text-[#14532D] underline' : 'text-[#14532D]'
+                      }`}
+                    >
+                      Passed {outcomeSummary.passed} ({passedPct}%)
+                    </button>
+                    <span aria-hidden="true" className="text-[#C5BDB0]">·</span>
+                    <button
+                      type="button"
+                      onClick={() => setOutcome((prev) => (prev === 'Failed' ? '' : 'Failed'))}
+                      className={`cursor-pointer hover:underline ${
+                        outcome === 'Failed' ? 'font-bold text-[#991B1B] underline' : 'text-[#991B1B]'
+                      }`}
+                    >
+                      Failed {outcomeSummary.failed} ({failedPct}%)
+                    </button>
+                    {outcomeSummary.vetoed > 0 && (
+                      <>
+                        <span aria-hidden="true" className="text-[#C5BDB0]">·</span>
+                        <button
+                          type="button"
+                          onClick={() => setOutcome((prev) => (prev === 'Vetoed' ? '' : 'Vetoed'))}
+                          className={`cursor-pointer hover:underline ${
+                            outcome === 'Vetoed' ? 'font-bold text-[#9A3412] underline' : 'text-[#9A3412]'
+                          }`}
+                        >
+                          Vetoed {outcomeSummary.vetoed} ({vetoedPct}%)
+                        </button>
+                      </>
+                    )}
+                  </div>
+                  {outcome && (
+                    <button
+                      type="button"
+                      onClick={() => setOutcome('')}
+                      className="text-[10px] text-[#57534E] hover:text-[#181715] underline cursor-pointer"
+                    >
+                      Show all
+                    </button>
+                  )}
+                </div>
+                <div className="h-1.5 w-full bg-[#EAE4D9] flex overflow-hidden">
+                  {outcomeSummary.passed > 0 && (
+                    <div
+                      style={{ width: `${(outcomeSummary.passed / totalPrev) * 100}%` }}
+                      className="bg-[#14532D]"
+                      title={`Passed: ${outcomeSummary.passed} (${passedPct}%)`}
+                    />
+                  )}
+                  {outcomeSummary.failed > 0 && (
+                    <div
+                      style={{ width: `${(outcomeSummary.failed / totalPrev) * 100}%` }}
+                      className="bg-[#991B1B]"
+                      title={`Failed: ${outcomeSummary.failed} (${failedPct}%)`}
+                    />
+                  )}
+                  {outcomeSummary.vetoed > 0 && (
+                    <div
+                      style={{ width: `${(outcomeSummary.vetoed / totalPrev) * 100}%` }}
+                      className="bg-[#9A3412]"
+                      title={`Vetoed: ${outcomeSummary.vetoed} (${vetoedPct}%)`}
+                    />
+                  )}
+                </div>
+              </div>
+            );
+          })()}
+
           {bills.length === 0 && !loadingList ? (
-            <div className="p-8 text-center space-y-3">
+            <div className="p-8 text-center space-y-3 flex-1 flex flex-col items-center justify-center">
               <p className="text-sm text-[#57534E]">
                 No Texas bills matched your keyword expression or chamber filter.
               </p>
@@ -658,6 +775,7 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
                   setQuery('');
                   setChamber('');
                   setStage('');
+                  setOutcome('');
                 }}
                 className="px-3 py-1.5 text-xs font-medium border border-[#C5BDB0] rounded hover:border-[#181715] cursor-pointer"
               >
@@ -665,7 +783,7 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
               </button>
             </div>
           ) : (
-            <div className="divide-y divide-[#DFD9CE] max-h-[780px] overflow-y-auto">
+            <div className="divide-y divide-[#DFD9CE] flex-1 min-h-0 max-h-[640px] lg:max-h-none overflow-y-auto">
               {bills.map((b) => {
                 const active = b.id === selectedBillId;
                 return (
@@ -678,13 +796,19 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
                     }`}
                   >
                     <div className="flex items-center justify-between gap-2 text-xs font-mono text-[#57534E]">
-                      <div className="flex items-center gap-1.5 min-w-0 truncate">
+                      <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
                         <span className="font-semibold text-[#9A3412]">{b.session}</span>
                         <span className="font-semibold text-[#181715]">{b.billNumber}</span>
+                        <OutcomeIndicator outcome={b.outcome} detail={b.outcomeDetail} />
                         <span aria-hidden="true">·</span>
                         <span>{b.chamber}</span>
-                        <span aria-hidden="true">·</span>
-                        <span>{b.stage}</span>
+                        {(b.outcome === 'Active' ||
+                          (b.outcome === 'Failed' && b.stage !== 'Stalled')) && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span>{b.stage}</span>
+                          </>
+                        )}
                       </div>
                       <span className="tabular-nums font-medium text-[#181715] shrink-0">
                         IDX {b.influenceScore.toFixed(1)}
@@ -720,10 +844,11 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
               })}
             </div>
           )}
+          </div>
         </div>
 
         {/* Right 7 cols: Full Broadsheet Bill Dossier */}
-        <div className="lg:col-span-7 border border-[#DFD9CE] bg-[#FFFFFF]">
+        <div className="lg:col-span-7 border border-[#DFD9CE] bg-[#FFFFFF] lg:min-h-[640px]">
           {loadingDetail ? (
             <div className="p-8 text-sm text-[#57534E]">Loading legislative dossier...</div>
           ) : !detail ? (
@@ -738,10 +863,15 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="font-semibold text-[#9A3412]">{detail.session}</span>
                     <span className="font-semibold text-[#181715]">{detail.billNumber}</span>
+                    <OutcomeIndicator outcome={detail.outcome} detail={detail.outcomeDetail} showDetail />
                     <span aria-hidden="true">·</span>
                     <span>Texas {detail.chamber}</span>
-                    <span aria-hidden="true">·</span>
-                    <span>{detail.stage}</span>
+                    {detail.outcome === 'Active' && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span>{detail.stage}</span>
+                      </>
+                    )}
                     <span aria-hidden="true">·</span>
                     <span className="tabular-nums">Influence {detail.influenceScore.toFixed(1)}</span>
                   </div>

@@ -11,6 +11,7 @@ import {
   FileText,
 } from 'lucide-react';
 import type { SessionTimelineResponse, TimelineEventItem } from '../types.ts';
+import { OutcomeIndicator } from './OutcomeIndicator.tsx';
 import { csvDateStamp, downloadCsv } from '../utils/csv.ts';
 
 interface TimelineViewProps {
@@ -351,17 +352,21 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
                           </div>
 
                           <div className="flex items-center gap-2 shrink-0 font-mono text-[11px] tabular-nums">
-                            <span
-                              className={
-                                cb.roleInCohort === 'Vehicle / Enacted'
-                                  ? 'text-[#14532D]'
-                                  : cb.roleInCohort === 'Stalled / Pending'
-                                    ? 'text-[#991B1B]'
-                                    : 'text-[#57534E]'
-                              }
-                            >
-                              {cb.roleInCohort}
-                            </span>
+                            {cb.outcome !== 'Active' ? (
+                              <OutcomeIndicator outcome={cb.outcome} detail={cb.outcomeDetail} />
+                            ) : (
+                              <span
+                                className={
+                                  cb.roleInCohort === 'Vehicle / Enacted'
+                                    ? 'text-[#14532D]'
+                                    : cb.roleInCohort === 'Stalled / Pending'
+                                      ? 'text-[#991B1B]'
+                                      : 'text-[#57534E]'
+                                }
+                              >
+                                {cb.roleInCohort}
+                              </span>
+                            )}
                             <span aria-hidden="true">·</span>
                             <button
                               type="button"

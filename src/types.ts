@@ -11,6 +11,8 @@ export type BillStage =
   | 'Vetoed'
   | 'Stalled';
 
+export type BillOutcome = 'Passed' | 'Failed' | 'Vetoed' | 'Active';
+
 export type LinkType =
   | 'Companion'
   | 'Omnibus Vehicle'
@@ -39,6 +41,8 @@ export interface BillSummary {
   statuteCodes: string[];
   status: string;
   stage: BillStage;
+  outcome: BillOutcome;
+  outcomeDetail: string;
   primaryAuthor: string;
   coauthors: string[];
   sponsors: string[];
@@ -235,6 +239,8 @@ export interface PoliticianDetail extends PoliticianSummary {
     session: string;
     title: string;
     stage: string;
+    outcome: BillOutcome;
+    outcomeDetail: string;
     role: string;
     influenceScore: number;
   }>;
@@ -494,6 +500,8 @@ export interface TimelineCohortBill {
   chamber: Chamber;
   title: string;
   stage: BillStage;
+  outcome: BillOutcome;
+  outcomeDetail: string;
   filedDate: string;
   lastActionDate: string;
   primaryAuthor: string;

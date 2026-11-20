@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Search, Share2, FileSpreadsheet, RefreshCw } from 'lucide-react';
 import type { PoliticianDetail, PoliticianSummary } from '../types.ts';
+import { OutcomeIndicator } from './OutcomeIndicator.tsx';
 import { csvDateStamp, downloadCsv } from '../utils/csv.ts';
 
 interface PoliticiansViewProps {
@@ -515,7 +516,7 @@ export const PoliticiansView: React.FC<PoliticiansViewProps> = ({
                     {detail.sponsorships.map((sp) => (
                       <div key={sp.billId} className="p-4 flex items-start justify-between gap-4">
                         <div className="min-w-0">
-                          <div className="flex items-center gap-2 text-xs font-mono">
+                          <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
                             <span className="font-semibold text-[#9A3412]">{sp.role}</span>
                             <span aria-hidden="true">·</span>
                             <button
@@ -525,8 +526,14 @@ export const PoliticiansView: React.FC<PoliticiansViewProps> = ({
                             >
                               {sp.session} {sp.billNumber}
                             </button>
-                            <span aria-hidden="true">·</span>
-                            <span className="text-[#57534E]">{sp.stage}</span>
+                            <OutcomeIndicator outcome={sp.outcome} detail={sp.outcomeDetail} />
+                            {(sp.outcome === 'Active' ||
+                              (sp.outcome === 'Failed' && sp.stage !== 'Stalled')) && (
+                              <>
+                                <span aria-hidden="true">·</span>
+                                <span className="text-[#57534E]">{sp.stage}</span>
+                              </>
+                            )}
                           </div>
                           <p className="text-sm text-[#181715] mt-1">{sp.title}</p>
                         </div>

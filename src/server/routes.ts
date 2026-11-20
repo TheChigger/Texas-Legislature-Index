@@ -23,6 +23,7 @@ import {
 import { fetchStatuteSnapshotByDate, syncTexasCodeFromTloFtp } from './statutes.ts';
 import type {
   BillDocument,
+  BillOutcome,
   BillStage,
   BillSummary,
   Chamber,
@@ -89,28 +90,118 @@ function safeStr(v: unknown, fallback = ''): string {
   return v == null ? fallback : String(v);
 }
 
+function computeBillOutcome(
+  session: string,
+  stage: string,
+  status: string,
+  lastAction: string,
+  committeesCount: number
+): { outcome: BillOutcome; outcomeDetail: string } {
+  const legNum = parseInt(session, 10);
+  const isPreviousSession = !Number.isNaN(legNum) && legNum < 90;
+  const combined = `${stage} ${status} ${lastAction}`.toLowerCase();
+
+  if (
+    stage === 'Vetoed' ||
+    (/\bvetoed\b/.test(combined) &&
+      !combined.includes('signed by the governor') &&
+      !combined.includes('line-item veto'))
+  ) {
+    return { outcome: 'Vetoed', outcomeDetail: 'Vetoed by Governor' };
+  }
+
+  if (
+    stage === 'Signed' ||
+    stage === 'Enrolled' ||
+    combined.includes('signed by the governor') ||
+    combined.includes('filed without the governor') ||
+    combined.includes('filed with the secretary of state') ||
+    combined.includes('effective on') ||
+    combined.includes('effective immediately') ||
+    combined.includes('became law') ||
+    combined.includes('enacted')
+  ) {
+    let passedDetail = 'Passed · Enacted';
+    if (combined.includes('filed without the governor')) {
+      passedDetail = 'Passed · Filed Without Signature';
+    } else if (combined.includes('filed with the secretary of state')) {
+      passedDetail = 'Passed · Filed with Sec. of State';
+    } else if (combined.includes('line-item veto')) {
+      passedDetail = 'Passed · Signed (Line-Item Veto)';
+    } else if (stage === 'Signed' || combined.includes('signed by the governor')) {
+      passedDetail = 'Passed · Signed';
+    } else if (stage === 'Enrolled') {
+      passedDetail = 'Passed · Enrolled';
+    }
+    return {
+      outcome: 'Passed',
+      outcomeDetail: passedDetail,
+    };
+  }
+
+  if (!isPreviousSession) {
+    return { outcome: 'Active', outcomeDetail: stage || 'In Progress' };
+  }
+
+  if (combined.includes('conference') || combined.includes('impasse')) {
+    return { outcome: 'Failed', outcomeDetail: 'Failed · Conference Impasse' };
+  }
+  if (stage === 'Engrossed') {
+    return { outcome: 'Failed', outcomeDetail: 'Failed · Died in Opposite Chamber' };
+  }
+  if (stage === 'Committee Reported') {
+    return { outcome: 'Failed', outcomeDetail: 'Failed · Died on Calendar / Floor' };
+  }
+  if (
+    stage === 'Committee Hearing' ||
+    committeesCount > 0 ||
+    combined.includes('committee') ||
+    combined.includes('referred to')
+  ) {
+    return { outcome: 'Failed', outcomeDetail: 'Failed · Died in Committee' };
+  }
+  if (stage === 'Stalled') {
+    return { outcome: 'Failed', outcomeDetail: 'Failed · Stalled at Sine Die' };
+  }
+  return { outcome: 'Failed', outcomeDetail: 'Failed · Died in Filing' };
+}
+
 function mapBillRow(row: RawBillRow): BillSummary {
   const linkCountRow = db
     .prepare(`SELECT COUNT(*) AS c FROM bill_links WHERE source_bill_id = ? OR target_bill_id = ?`)
     .get(row.id, row.id) as { c: number };
 
+  const committees = JSON.parse(safeStr(row.committees_json, '[]')) as BillSummary['committees'];
+  const session = safeStr(row.session);
+  const status = safeStr(row.status);
+  const lastAction = safeStr(row.last_action);
+  const { outcome, outcomeDetail } = computeBillOutcome(
+    session,
+    row.stage,
+    status,
+    lastAction,
+    committees.length
+  );
+
   return {
     id: safeStr(row.id),
-    session: safeStr(row.session),
+    session,
     billNumber: safeStr(row.bill_number),
     chamber: (safeStr(row.chamber, 'House') as Chamber),
     title: safeStr(row.title),
     summary: safeStr(row.summary),
     statuteCodes: JSON.parse(safeStr(row.statute_codes, '[]')),
-    status: safeStr(row.status),
+    status,
     stage: row.stage,
+    outcome,
+    outcomeDetail,
     primaryAuthor: safeStr(row.primary_author),
     coauthors: JSON.parse(safeStr(row.coauthors_json, '[]')),
     sponsors: JSON.parse(safeStr(row.sponsors_json, '[]')),
     cosponsors: JSON.parse(safeStr(row.cosponsors_json, '[]')),
-    committees: JSON.parse(safeStr(row.committees_json, '[]')),
+    committees,
     subjects: JSON.parse(safeStr(row.subjects_json, '[]')),
-    lastAction: safeStr(row.last_action),
+    lastAction,
     lastActionDate: safeStr(row.last_action_date),
     filedDate: safeStr(row.filed_date),
     influenceScore: Number(row.influence_score) || 0,
@@ -317,6 +408,7 @@ apiRouter.get('/bills', (req, res) => {
   const session = String(req.query.session ?? '').trim();
   const chamber = String(req.query.chamber ?? '').trim();
   const stage = String(req.query.stage ?? '').trim();
+  const outcomeFilter = String(req.query.outcome ?? '').trim();
   const committee = String(req.query.committee ?? '').trim();
   const sort = String(req.query.sort ?? 'influence').trim();
   const parsedLimit = Number(req.query.limit);
@@ -353,6 +445,53 @@ apiRouter.get('/bills', (req, res) => {
           ? 'bm25(bills_fts) ASC, b.influence_score DESC'
           : 'b.influence_score DESC, b.amendment_count DESC';
 
+  const finalizeResponse = (allRows: RawBillRow[], queryUsed: string) => {
+    let passed = 0;
+    let failed = 0;
+    let vetoed = 0;
+    let active = 0;
+    const filteredRows: RawBillRow[] = [];
+
+    for (const r of allRows) {
+      let commCount = 0;
+      try {
+        commCount = (JSON.parse(safeStr(r.committees_json, '[]')) as unknown[]).length;
+      } catch {
+        commCount = 0;
+      }
+      const { outcome } = computeBillOutcome(
+        safeStr(r.session),
+        r.stage,
+        safeStr(r.status),
+        safeStr(r.last_action),
+        commCount
+      );
+      if (outcome === 'Passed') passed++;
+      else if (outcome === 'Failed') failed++;
+      else if (outcome === 'Vetoed') vetoed++;
+      else active++;
+
+      if (!outcomeFilter || outcome === outcomeFilter) {
+        if (filteredRows.length < limit) {
+          filteredRows.push(r);
+        }
+      }
+    }
+
+    const totalPrevious = passed + failed + vetoed;
+    return res.json({
+      bills: filteredRows.map(mapBillRow),
+      queryUsed,
+      outcomeSummary: {
+        passed,
+        failed,
+        vetoed,
+        active,
+        totalPrevious,
+      },
+    });
+  };
+
   if (q) {
     const safeFts = buildSafeFtsQuery(q);
     if (safeFts) {
@@ -366,10 +505,9 @@ apiRouter.get('/bills', (req, res) => {
           WHERE bills_fts MATCH ?
           ${where.length ? 'AND ' + where.join(' AND ') : ''}
           ORDER BY ${orderClause}
-          LIMIT ?
         `;
-        const rows = db.prepare(sql).all(safeFts, ...params, limit) as RawBillRow[];
-        return res.json({ bills: rows.map(mapBillRow), queryUsed: safeFts });
+        const rows = db.prepare(sql).all(safeFts, ...params) as RawBillRow[];
+        return finalizeResponse(rows, safeFts);
       } catch {
         // Fallback to LIKE if FTS syntax is unusual
       }
@@ -383,10 +521,9 @@ apiRouter.get('/bills', (req, res) => {
     FROM bills b
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
     ORDER BY ${orderClause === 'bm25(bills_fts) ASC, b.influence_score DESC' ? 'b.influence_score DESC' : orderClause}
-    LIMIT ?
   `;
-  const rows = db.prepare(sql).all(...params, limit) as RawBillRow[];
-  res.json({ bills: rows.map(mapBillRow), queryUsed: q });
+  const rows = db.prepare(sql).all(...params) as RawBillRow[];
+  return finalizeResponse(rows, q);
 });
 
 // 3. Single Bill Dossier
@@ -907,7 +1044,7 @@ apiRouter.get('/politicians/:id', (req, res) => {
 
   const allBills = db
     .prepare(
-      `SELECT id, bill_number, session, title, stage, primary_author, coauthors_json, sponsors_json, cosponsors_json, influence_score
+      `SELECT id, bill_number, session, title, stage, status, last_action, committees_json, primary_author, coauthors_json, sponsors_json, cosponsors_json, influence_score
        FROM bills ORDER BY influence_score DESC`
     )
     .all() as Array<{
@@ -916,6 +1053,9 @@ apiRouter.get('/politicians/:id', (req, res) => {
     session: string;
     title: string;
     stage: string;
+    status: string;
+    last_action: string;
+    committees_json: string;
     primary_author: string;
     coauthors_json: string;
     sponsors_json: string;
@@ -929,6 +1069,8 @@ apiRouter.get('/politicians/:id', (req, res) => {
     session: string;
     title: string;
     stage: string;
+    outcome: BillOutcome;
+    outcomeDetail: string;
     role: string;
     influenceScore: number;
   }> = [];
@@ -940,12 +1082,27 @@ apiRouter.get('/politicians/:id', (req, res) => {
     else if ((JSON.parse(b.coauthors_json) as string[]).includes(pol.shortName)) role = 'Co-Author';
     else if ((JSON.parse(b.cosponsors_json) as string[]).includes(pol.shortName)) role = 'Co-Sponsor';
     if (role) {
+      let commCount = 0;
+      try {
+        commCount = (JSON.parse(b.committees_json || '[]') as unknown[]).length;
+      } catch {
+        commCount = 0;
+      }
+      const { outcome, outcomeDetail } = computeBillOutcome(
+        b.session,
+        b.stage,
+        b.status || '',
+        b.last_action || '',
+        commCount
+      );
       sponsorships.push({
         billId: b.id,
         billNumber: b.bill_number,
         session: b.session,
         title: b.title,
         stage: b.stage,
+        outcome,
+        outcomeDetail,
         role,
         influenceScore: b.influence_score,
       });
@@ -2300,7 +2457,7 @@ apiRouter.get('/timeline', (req, res) => {
   const billRows = db
     .prepare(
       `SELECT id, session, bill_number, chamber, title, summary, statute_codes, status, stage,
-              primary_author, committees_json, subjects_json, filed_date, last_action_date,
+              primary_author, committees_json, subjects_json, filed_date, last_action, last_action_date,
               amendment_count, influence_score
        FROM bills
        ${sessionParam ? 'WHERE session = ?' : ''}
@@ -2321,6 +2478,7 @@ apiRouter.get('/timeline', (req, res) => {
     committees_json: string;
     subjects_json: string;
     filed_date: string;
+    last_action: string;
     last_action_date: string;
     amendment_count: number;
     influence_score: number;
@@ -2526,6 +2684,14 @@ apiRouter.get('/timeline', (req, res) => {
         else if (m.stage === 'Stalled') roleInCohort = 'Stalled / Pending';
         else if (m.stage === 'Pre-Filed') roleInCohort = 'Pre-Filed';
 
+        const { outcome, outcomeDetail } = computeBillOutcome(
+          m.session,
+          m.stage,
+          m.status || '',
+          m.last_action || '',
+          m.committees.length
+        );
+
         return {
           id: m.id,
           billNumber: m.bill_number,
@@ -2533,6 +2699,8 @@ apiRouter.get('/timeline', (req, res) => {
           chamber: m.chamber,
           title: m.title,
           stage: m.stage,
+          outcome,
+          outcomeDetail,
           filedDate: m.isoFiledDate,
           lastActionDate: m.isoLastDate,
           primaryAuthor: m.primary_author,
