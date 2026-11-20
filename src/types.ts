@@ -587,4 +587,50 @@ export interface SessionTimelineResponse {
   availableCommittees: string[];
 }
 
+export interface ResearchToolTrace {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+  summary: string;
+  durationMs: number;
+  resultCount?: number;
+}
 
+export interface ResearchCitedBill {
+  id: string;
+  session: string;
+  billNumber: string;
+  title: string;
+  chamber: Chamber;
+  stage: string;
+  outcome: BillOutcome;
+  outcomeDetail: string;
+  primaryAuthor: string;
+  influenceScore: number;
+}
+
+export interface ResearchCitedPolitician {
+  id: string;
+  name: string;
+  shortName: string;
+  chamber: Chamber;
+  party: 'R' | 'D' | '—';
+  district: string;
+  leadershipRole: string;
+  score?: number;
+  reason?: string;
+}
+
+export interface ResearchQueryRecord {
+  id: string;
+  question: string;
+  sessionScope: string;
+  answer: string;
+  model: string;
+  mode: 'llm_agent' | 'llm_grounded' | 'deterministic_fallback';
+  warning?: string;
+  toolCalls: ResearchToolTrace[];
+  citedBills: ResearchCitedBill[];
+  citedPoliticians: ResearchCitedPolitician[];
+  createdAt: string;
+}

@@ -8,6 +8,7 @@ import { AmendmentsView } from './components/AmendmentsView.tsx';
 import { AlertsView } from './components/AlertsView.tsx';
 import { ReceptivityView } from './components/ReceptivityView.tsx';
 import { StatutesView } from './components/StatutesView.tsx';
+import { ResearchDeskView } from './components/ResearchDeskView.tsx';
 import { TloSyncModal } from './components/TloSyncModal.tsx';
 import { NewBillModal } from './components/NewBillModal.tsx';
 import { NewAlertModal } from './components/NewAlertModal.tsx';
@@ -33,13 +34,14 @@ export default function App() {
   useEffect(() => {
     const VIEW_KEYS: Record<string, ActiveView> = {
       '1': 'legislation',
-      '2': 'timeline',
-      '3': 'politicians',
-      '4': 'receptivity',
-      '5': 'network',
-      '6': 'amendments',
-      '7': 'statutes',
-      '8': 'alerts',
+      '2': 'research',
+      '3': 'timeline',
+      '4': 'politicians',
+      '5': 'receptivity',
+      '6': 'network',
+      '7': 'amendments',
+      '8': 'statutes',
+      '9': 'alerts',
     };
 
     const focusPrimarySearch = () => {
@@ -249,6 +251,15 @@ export default function App() {
             onOpenNewBill={() => setShowNewBillModal(true)}
             refreshSignal={refreshSignal}
             onDataMutated={triggerRefresh}
+          />
+        )}
+
+        {activeView === 'research' && (
+          <ResearchDeskView
+            activeSession={activeSession}
+            onOpenBill={handleOpenBill}
+            onOpenPolitician={handleOpenPolitician}
+            onOpenTloSync={() => setShowTloModal(true)}
           />
         )}
 

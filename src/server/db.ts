@@ -335,6 +335,20 @@ export function initSchema(): void {
       model TEXT NOT NULL DEFAULT '',
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS research_history (
+      id TEXT PRIMARY KEY,
+      question TEXT NOT NULL,
+      session_scope TEXT NOT NULL DEFAULT '',
+      answer TEXT NOT NULL,
+      model TEXT NOT NULL DEFAULT '',
+      mode TEXT NOT NULL DEFAULT 'llm_agent',
+      warning TEXT NOT NULL DEFAULT '',
+      tool_calls_json TEXT NOT NULL DEFAULT '[]',
+      cited_bills_json TEXT NOT NULL DEFAULT '[]',
+      cited_politicians_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL
+    );
   `);
 
   cleanExistingIndexedHtml();

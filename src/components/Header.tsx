@@ -2,6 +2,7 @@ import React from 'react';
 
 export type ActiveView =
   | 'legislation'
+  | 'research'
   | 'timeline'
   | 'politicians'
   | 'receptivity'
@@ -25,6 +26,7 @@ export const Header: React.FC<HeaderProps> = ({
 }) => {
   const navItems: Array<{ id: ActiveView; label: string }> = [
     { id: 'legislation', label: 'Legislation' },
+    { id: 'research', label: 'Research Desk' },
     { id: 'timeline', label: 'Timeline' },
     { id: 'politicians', label: 'Politicians' },
     { id: 'receptivity', label: 'Receptivity' },

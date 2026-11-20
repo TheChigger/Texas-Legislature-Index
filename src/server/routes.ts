@@ -21,6 +21,11 @@ import {
   type TloBillType,
 } from './tloFtp.ts';
 import { fetchStatuteSnapshotByDate, syncTexasCodeFromTloFtp } from './statutes.ts';
+import {
+  deleteResearchHistoryItem,
+  listResearchHistory,
+  runResearchAgent,
+} from './researchAgent.ts';
 import type {
   BillDocument,
   BillOutcome,
@@ -3143,4 +3148,40 @@ apiRouter.get('/timeline', (req, res) => {
   });
 });
 
+// 14. AI Legislative Research Agent (Tool-Calling Local LLM + Deterministic SQLite/FTS5 Tools)
+apiRouter.get('/research/history', (_req, res) => {
+  res.json({ items: listResearchHistory(40) });
+});
 
+apiRouter.post('/research/ask', async (req, res) => {
+  const question = String(req.body?.question ?? '').trim();
+  const sessionScope = String(req.body?.sessionScope ?? '').trim();
+  const priorTurns = Array.isArray(req.body?.priorTurns)
+    ? (req.body.priorTurns as Array<{ question: string; answer: string }>)
+        .filter((t) => t && typeof t.question === 'string' && typeof t.answer === 'string')
+        .slice(-3)
+    : [];
+
+  if (!question) {
+    return res.status(400).json({ error: 'A legislative research question is required.' });
+  }
+
+  try {
+    const record = await runResearchAgent({
+      question,
+      sessionScope,
+      priorTurns,
+    });
+    res.json({ record });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Research agent execution failed.',
+    });
+  }
+});
+
+apiRouter.delete('/research/history/:id', (req, res) => {
+  const deleted = deleteResearchHistoryItem(req.params.id);
+  if (!deleted) return res.status(404).json({ error: 'Research record not found' });
+  res.json({ deleted: true });
+});
