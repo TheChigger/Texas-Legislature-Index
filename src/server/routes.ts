@@ -3,6 +3,7 @@ import {
   buildSafeFtsQuery,
   db,
   evaluateAlertRules,
+  isProceduralCommittee,
   normalizeIsoDate,
   recomputeBillMetrics,
   refreshSessionCounts,
@@ -360,6 +361,7 @@ apiRouter.get('/overview', (req, res) => {
       status: string;
     }>;
     for (const c of comms) {
+      if (isProceduralCommittee(c.name)) continue;
       const key = `${c.chamber}-${c.name}`;
       const cur = committeeMap.get(key) ?? { name: c.name, chamber: c.chamber, referred: 0, reported: 0 };
       cur.referred++;

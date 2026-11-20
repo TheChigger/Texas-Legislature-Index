@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { db } from './db.ts';
+import { db, isProceduralCommittee } from './db.ts';
 import type {
   BillOutcome,
   Chamber,
@@ -221,6 +221,51 @@ const POLICY_EXPANSIONS: PolicyExpansion[] = [
     fiscalRelevant: true,
   },
   {
+    triggers: [
+      'artificial intelligence',
+      'generative ai',
+      'machine learning',
+      'ai regulation',
+      'ai governance',
+      'ai safety',
+      'ai act',
+      'ai policy',
+      'ai bill',
+      'ai bills',
+      'deepfake',
+      'algorithmic',
+      'automated decision',
+      'ai',
+    ],
+    billTerms: [
+      'artificial intelligence',
+      'generative artificial intelligence',
+      'generative ai',
+      'machine learning',
+      'automated decision system',
+      'automated decision-making',
+      'algorithmic',
+      'deepfake',
+      'large language model',
+      'neural network',
+      'ai system',
+      'ai systems',
+      'ai model',
+      'ai models',
+      'ai',
+    ],
+    committeeTerms: [
+      'state affairs',
+      'business',
+      'technology',
+      'innovation',
+      'delivery of government efficiency',
+      'trade',
+    ],
+    donorSectors: ['tech', 'technology', 'software', 'telecom', 'data'],
+    fiscalRelevant: false,
+  },
+  {
     triggers: ['budget', 'appropriations', 'spending', 'fiscal', 'revenue'],
     billTerms: ['appropriations', 'biennium', 'budget', 'comptroller', 'grant'],
     committeeTerms: ['appropriations', 'finance', 'ways & means'],
@@ -229,10 +274,30 @@ const POLICY_EXPANSIONS: PolicyExpansion[] = [
   },
 ];
 
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Word-boundary matcher so short tokens like "ai" NEVER match inside "affairs",
+ * "certain", "maintain", "paid", "training", etc.
+ */
+function matchesTermWithBoundary(haystack: string, term: string): boolean {
+  const clean = term.trim().toLowerCase();
+  if (!clean) return false;
+  // Multi-word phrases and short tokens (<= 4 chars) require exact start + end word boundaries.
+  // Longer single words allow prefix stem matching (e.g. "regul" -> "regulation"/"regulating") at word start.
+  const pattern =
+    clean.includes(' ') || clean.length <= 4
+      ? `\\b${escapeRegExp(clean)}\\b`
+      : `\\b${escapeRegExp(clean)}`;
+  return new RegExp(pattern, 'i').test(haystack);
+}
+
 function findPolicyExpansion(topic: string): PolicyExpansion | null {
   const lower = topic.toLowerCase();
   for (const exp of POLICY_EXPANSIONS) {
-    if (exp.triggers.some((t) => lower.includes(t))) {
+    if (exp.triggers.some((t) => matchesTermWithBoundary(lower, t))) {
       return exp;
     }
   }
@@ -259,6 +324,24 @@ const STOP_WORDS = new Set([
   'legislature',
   'session',
   'sessions',
+]);
+
+// Generic legislative intent modifiers stripped if strict AND returns 0 hits
+const GENERIC_INTENT_MODIFIERS = new Set([
+  'regulation',
+  'regulations',
+  'regulatory',
+  'regulate',
+  'regulating',
+  'law',
+  'laws',
+  'legislation',
+  'rule',
+  'rules',
+  'governance',
+  'oversight',
+  'reform',
+  'reforms',
 ]);
 
 function extractQueryTokens(raw: string): string[] {
@@ -290,7 +373,7 @@ function buildFtsFromNaturalText(raw: string, metadataColumnsOnly = true): strin
 function buildOrFtsFromTerms(terms: string[], metadataColumnsOnly = true): string {
   const parts = terms
     .map((t) => t.replace(/['"`*?()[\]{}:^~]/g, ' ').trim())
-    .filter((t) => t.length >= 3)
+    .filter((t) => t.length >= 2)
     .map((t) => (t.includes(' ') || t.length < 5 ? `"${t}"` : `"${t}"*`));
   const unique = Array.from(new Set(parts));
   if (unique.length === 0) return '';
@@ -490,13 +573,13 @@ function toolGetArchiveOverview(
 }
 
 function billMetadataContainsTokens(row: BillDbRow, tokens: string[]): boolean {
-  const hay = `${row.title} ${row.summary} ${row.subjects_json} ${row.statute_codes}`.toLowerCase();
-  return tokens.every((t) => hay.includes(t.toLowerCase()));
+  const hay = `${row.title} ${row.summary} ${row.subjects_json} ${row.statute_codes}`;
+  return tokens.every((t) => matchesTermWithBoundary(hay, t));
 }
 
 function billMetadataContainsAnyPhrase(row: BillDbRow, phrases: string[]): boolean {
-  const hay = `${row.title} ${row.summary} ${row.subjects_json} ${row.statute_codes}`.toLowerCase();
-  return phrases.some((p) => hay.includes(p.toLowerCase()));
+  const hay = `${row.title} ${row.summary} ${row.subjects_json} ${row.statute_codes}`;
+  return phrases.some((p) => matchesTermWithBoundary(hay, p));
 }
 
 function queryBillsMatchingText(
@@ -553,54 +636,15 @@ function queryBillsMatchingText(
   }
 
   const tokens = extractQueryTokens(trimmed);
+  const coreTokens = tokens.filter((t) => !GENERIC_INTENT_MODIFIERS.has(t.toLowerCase()));
+  const exp = findPolicyExpansion(trimmed) || (coreTokens.length > 0 ? findPolicyExpansion(coreTokens.join(' ')) : null);
 
-  // 1. Try column-restricted FTS5 query (title, summary, subjects, statute_codes — excludes full_text)
-  const ftsStrict = buildFtsFromNaturalText(trimmed, metadataOnly);
-  if (ftsStrict) {
-    try {
-      const whereSql = conditions.length ? `AND ${conditions.join(' AND ')}` : '';
-      const rawRows = db
-        .prepare(
-          `SELECT b.*
-           FROM bills_fts
-           JOIN bills b ON b.id = bills_fts.bill_id
-           WHERE bills_fts MATCH ? ${whereSql}
-           ORDER BY b.influence_score DESC, b.last_action_date DESC`
-        )
-        .all(ftsStrict, ...params) as BillDbRow[];
-      const verified =
-        metadataOnly && tokens.length > 0
-          ? rawRows.filter((r) => billMetadataContainsTokens(r, tokens))
-          : rawRows;
-      if (verified.length > 0) {
-        return { rows: verified, matchMode: 'exact_metadata_fts' };
-      }
-    } catch {
-      // Fall through to LIKE metadata matching
-    }
-  }
-
-  // 2. Fallback to substring LIKE strictly on metadata fields (title, summary, subjects_json, statute_codes)
-  {
-    const likeExpr = metadataOnly
-      ? `(LOWER(b.title) LIKE LOWER(?) OR LOWER(b.summary) LIKE LOWER(?) OR LOWER(b.subjects_json) LIKE LOWER(?) OR LOWER(b.statute_codes) LIKE LOWER(?))`
-      : `(LOWER(b.title) LIKE LOWER(?) OR LOWER(b.summary) LIKE LOWER(?) OR LOWER(b.subjects_json) LIKE LOWER(?) OR LOWER(b.full_text) LIKE LOWER(?))`;
-    const likeCond = [...conditions, likeExpr];
-    const pat = `%${trimmed}%`;
-    const rows = db
-      .prepare(
-        `SELECT b.* FROM bills b WHERE ${likeCond.join(' AND ')} ORDER BY b.influence_score DESC, b.last_action_date DESC`
-      )
-      .all(...params, pat, pat, pat, pat) as BillDbRow[];
-    if (rows.length > 0) {
-      return { rows, matchMode: 'exact_metadata_fts' };
-    }
-  }
-
-  // 3. Domain synonym expansion — still strictly restricted to metadata columns (never full_text)
-  const exp = findPolicyExpansion(trimmed);
+  // 1. If a curated domain expansion matches (e.g. "AI regulation" -> artificial intelligence + word-bounded AI,
+  // or "autonomous driving" -> autonomous/automated vehicle phrases), run column-restricted FTS5 across
+  // the expansion terms AND verify with word-boundary regex against metadata columns ONLY.
   if (exp) {
-    const ftsExpanded = buildOrFtsFromTerms(exp.billTerms, metadataOnly);
+    const combinedTerms = Array.from(new Set([...exp.billTerms]));
+    const ftsExpanded = buildOrFtsFromTerms(combinedTerms, metadataOnly);
     if (ftsExpanded) {
       try {
         const whereSql = conditions.length ? `AND ${conditions.join(' AND ')}` : '';
@@ -614,14 +658,67 @@ function queryBillsMatchingText(
           )
           .all(ftsExpanded, ...params) as BillDbRow[];
         const verified = metadataOnly
-          ? rawRows.filter((r) => billMetadataContainsAnyPhrase(r, exp.billTerms))
+          ? rawRows.filter((r) => billMetadataContainsAnyPhrase(r, combinedTerms))
           : rawRows;
-        if (verified.length > 0) {
-          return { rows: verified, matchMode: 'expanded_metadata_fts' };
-        }
+        return { rows: verified, matchMode: 'expanded_metadata_fts' };
       } catch {
-        // ignore
+        // Fall through to exact FTS below
       }
+    }
+  }
+
+  const runFtsForTokens = (toks: string[]): BillDbRow[] => {
+    if (toks.length === 0) return [];
+    const ftsExpr = buildFtsFromNaturalText(toks.join(' '), metadataOnly);
+    if (!ftsExpr) return [];
+    try {
+      const whereSql = conditions.length ? `AND ${conditions.join(' AND ')}` : '';
+      const rawRows = db
+        .prepare(
+          `SELECT b.*
+           FROM bills_fts
+           JOIN bills b ON b.id = bills_fts.bill_id
+           WHERE bills_fts MATCH ? ${whereSql}
+           ORDER BY b.influence_score DESC, b.last_action_date DESC`
+        )
+        .all(ftsExpr, ...params) as BillDbRow[];
+      return metadataOnly ? rawRows.filter((r) => billMetadataContainsTokens(r, toks)) : rawRows;
+    } catch {
+      return [];
+    }
+  };
+
+  // 2. Column-restricted FTS5 on all query tokens (strictly metadata columns + word-boundary verified)
+  const exactRows = runFtsForTokens(tokens);
+  if (exactRows.length > 0) {
+    return { rows: exactRows, matchMode: 'exact_metadata_fts' };
+  }
+
+  // 3. If generic intent modifiers (e.g. "regulation", "laws", "rules") caused 0 hits on strict AND,
+  // retry with just the substantive subject tokens (still strictly metadata + word-boundary verified)
+  if (coreTokens.length > 0 && coreTokens.length < tokens.length) {
+    const coreRows = runFtsForTokens(coreTokens);
+    if (coreRows.length > 0) {
+      return { rows: coreRows, matchMode: 'exact_metadata_fts' };
+    }
+  }
+
+  // 4. Safe metadata-only LIKE fallback ONLY for phrases >= 4 chars (never short tokens like "AI"),
+  // strictly verified with word-boundary matching so substrings like "Affairs" never leak
+  if (trimmed.length >= 4 && tokens.every((t) => t.length >= 4)) {
+    const likeExpr = metadataOnly
+      ? `(LOWER(b.title) LIKE LOWER(?) OR LOWER(b.summary) LIKE LOWER(?) OR LOWER(b.subjects_json) LIKE LOWER(?) OR LOWER(b.statute_codes) LIKE LOWER(?))`
+      : `(LOWER(b.title) LIKE LOWER(?) OR LOWER(b.summary) LIKE LOWER(?) OR LOWER(b.subjects_json) LIKE LOWER(?) OR LOWER(b.full_text) LIKE LOWER(?))`;
+    const likeCond = [...conditions, likeExpr];
+    const pat = `%${trimmed}%`;
+    const rows = db
+      .prepare(
+        `SELECT b.* FROM bills b WHERE ${likeCond.join(' AND ')} ORDER BY b.influence_score DESC, b.last_action_date DESC`
+      )
+      .all(...params, pat, pat, pat, pat) as BillDbRow[];
+    const verified = metadataOnly ? rows.filter((r) => billMetadataContainsTokens(r, tokens)) : rows;
+    if (verified.length > 0) {
+      return { rows: verified, matchMode: 'exact_metadata_fts' };
     }
   }
 
@@ -844,6 +941,7 @@ function toolGetCommitteeStats(
     chamber?: string;
     session?: string;
     sortBy?: 'bottleneck' | 'most_referred' | 'highest_passage';
+    includeProcedural?: boolean;
     limit?: number;
   },
   ctx: AgentExecutionContext
@@ -852,6 +950,8 @@ function toolGetCommitteeStats(
   const chamberFilter = safeStr(args.chamber).trim();
   const sessionFilter = normalizeSessionCode(args.session || '');
   const sortBy = args.sortBy || 'bottleneck';
+  const queryAsksProcedural = /\b(calendar|calendars|procedural|administration|rules\s*(?:&|and)\s*resolutions)\b/i.test(q);
+  const includeProcedural = Boolean(args.includeProcedural) || queryAsksProcedural;
   const limit = Math.min(25, Math.max(1, Number(args.limit) || 12));
   const expansion = q ? findPolicyExpansion(q) : null;
 
@@ -982,6 +1082,7 @@ function toolGetCommitteeStats(
 
     return {
       ...a,
+      isProcedural: isProceduralCommittee(a.name),
       reportRatePct,
       passageRatePct,
       chair: meta?.chair_name || 'Unassigned',
@@ -992,6 +1093,17 @@ function toolGetCommitteeStats(
       jurisdiction: meta?.jurisdiction || '',
     };
   });
+
+  const excludedProceduralCommittees = includeProcedural
+    ? []
+    : rows.filter((r) => r.isProcedural).map((r) => `${r.chamber} ${r.name}`);
+
+  if (!includeProcedural) {
+    const substantive = rows.filter((r) => !r.isProcedural);
+    if (substantive.length > 0) {
+      rows = substantive;
+    }
+  }
 
   if (q) {
     const matched = rows.filter((r) => {
@@ -1039,13 +1151,16 @@ function toolGetCommitteeStats(
   const payload = {
     scope: sessionFilter || 'ALL SESSIONS',
     chamberFilter: chamberFilter || 'ALL',
-    query: q || '(all committees)',
+    query: q || '(all substantive committees)',
     sortBy,
+    proceduralExcluded: !includeProcedural,
+    ...(excludedProceduralCommittees.length > 0 ? { excludedProceduralCommittees } : {}),
     totalBillsEvaluatedInScope: billRows.length,
     totalCommitteesWithReferrals: rows.length,
     committees: top.map((r) => ({
       committee: `${r.chamber} ${r.name}`,
       chamber: r.chamber,
+      isProcedural: r.isProcedural,
       chair: r.chair,
       viceChair: r.viceChair,
       jurisdiction: r.jurisdiction,
@@ -1062,7 +1177,7 @@ function toolGetCommitteeStats(
 
   return {
     payload,
-    summary: `Computed real referral/passage stats for ${rows.length} committee${rows.length === 1 ? '' : 's'} from ${billRows.length} bills${sessionFilter ? ` in ${sessionFilter}` : ''}`,
+    summary: `Computed real referral/passage stats for ${rows.length} ${includeProcedural ? '' : 'substantive '}committee${rows.length === 1 ? '' : 's'} from ${billRows.length} bills${sessionFilter ? ` in ${sessionFilter}` : ''}`,
     resultCount: top.length,
   };
 }
@@ -1665,7 +1780,8 @@ const OPENAI_TOOLS = [
           },
           minBipartisanIndex: {
             type: 'number',
-            description: 'Optional minimum bipartisan index (0.0-1.0) when the user asks for high-bipartisan bills.',
+            description:
+              'Optional minimum bipartisan index (0.0-1.0). In Texas legislative data, 0.35-0.60 is already strongly bipartisan. When the user asks for "high bipartisan" without giving a number, do NOT set this above 0.40 (prefer 0.35 with sortBy="influence_and_bipartisan" or "bipartisan").',
           },
           sortBy: {
             type: 'string',
@@ -1682,7 +1798,7 @@ const OPENAI_TOOLS = [
     function: {
       name: 'get_committee_stats',
       description:
-        'Compute real committee bottleneck, referral, reporting, and passage rate statistics directly from the bills table (committees_json) and committee chairs. Use this for any question about committee passage rates, bottlenecks, referrals, or chairs.',
+        'Compute real committee bottleneck, referral, reporting, and passage rate statistics directly from the bills table (committees_json) and committee chairs. Excludes procedural scheduling committees (House Calendars, Local & Consent Calendars, Administration) by default unless includeProcedural=true.',
       parameters: {
         type: 'object',
         properties: {
@@ -1696,6 +1812,11 @@ const OPENAI_TOOLS = [
             type: 'string',
             enum: ['bottleneck', 'most_referred', 'highest_passage'],
             description: 'Use "bottleneck" for lowest passage/report rates, "most_referred" for highest volume, "highest_passage" for highest passage rates.',
+          },
+          includeProcedural: {
+            type: 'boolean',
+            description:
+              'Default false (substantive policy committees only). Set true ONLY when the user explicitly asks about Calendars, Administration, or procedural committees.',
           },
           limit: { type: 'number', description: 'Max committees to return (default 12).' },
         },
@@ -1891,7 +2012,7 @@ function extractTopicFromQuestion(question: string): string {
     if (m && m[1]) {
       const candidate = m[1]
         .replace(
-          /\b(in\s+\d{2}(?:[r1-4]|-\d)|across\s+[\w\s,-]+|in\s+texas|policy|legislation|bills?|session|sessions|previous sessions?|passed|failed|died|committee|committees|bottleneck|bottlenecks|passage\s+rates?|vs\.?|high|both|influence|score|scores|bipartisan|index)\b/gi,
+          /\b(have\s+been\s+(?:introduced|filed|passed|enacted)|were\s+(?:introduced|filed|passed|enacted)|in\s+\d{2}(?:[r1-4]|-\d)|across\s+[\w\s,-]+|in\s+texas|policy|legislation|bills?|session|sessions|previous sessions?|introduced|filed|passed|failed|died|committee|committees|bottleneck|bottlenecks|passage\s+rates?|vs\.?|high|both|influence|score|scores|bipartisan|index)\b/gi,
           ' '
         )
         .replace(/\s+/g, ' ')
@@ -1935,7 +2056,7 @@ function runDeterministicPlan(
     );
   const isCommitteeStatsQuery =
     !disposition &&
-    /\b(committee|committees)\b/i.test(lower) &&
+    /\b(committee|committees|calendars?)\b/i.test(lower) &&
     /\b(bottleneck|bottlenecks|passage\s+rate|pass\s+rate|report\s+rate|referral|referred|lowest|highest|most|chair|chairs|stats|statistics)\b/i.test(
       lower
     );
@@ -1969,6 +2090,10 @@ function runDeterministicPlan(
         ? 'most_referred'
         : 'bottleneck';
 
+    const includeProcedural = /\b(calendar|calendars|procedural|administration|rules\s*(?:&|and)\s*resolutions)\b/i.test(
+      lower
+    );
+
     const commRes = executeTool(
       'get_committee_stats',
       {
@@ -1976,6 +2101,7 @@ function runDeterministicPlan(
         ...(chamber ? { chamber } : {}),
         ...(session ? { session } : {}),
         sortBy,
+        includeProcedural,
         limit: 12,
       },
       ctx
@@ -2075,7 +2201,7 @@ function runDeterministicPlan(
         ...(chamber ? { chamber } : {}),
         ...(outcomeParam ? { outcome: outcomeParam } : {}),
         ...(disposition ? { disposition } : {}),
-        ...(isBipartisanQuery ? { minBipartisanIndex: 0.3 } : {}),
+        ...(isBipartisanQuery ? { minBipartisanIndex: 0.35 } : {}),
         ...(isBipartisanQuery && /\binfluence\b/i.test(lower) ? { minInfluenceScore: 40 } : {}),
         sortBy,
         limit: 12,
@@ -2177,8 +2303,8 @@ You have read-only tools connected directly to the user's live SQLite + FTS5 Tex
 STRICT ACCURACY & GROUNDING RULES:
 1. ALWAYS call the appropriate tools before answering. NEVER invent counts, percentages, bill numbers, committee stats, or legislator names.
 2. NEVER default to a specific session (like 89R) unless the user explicitly named a session OR an [Active Session Filter] header is present. When no session is specified, OMIT the session parameter so you search ALL indexed sessions, and report counts across all sessions (or broken down by session).
-3. RESPECT EVERY CRITERION in the user's question. If the user asks for multiple criteria (e.g., BOTH high influence score AND high bipartisan index), pass minInfluenceScore / minBipartisanIndex / sortBy="influence_and_bipartisan" and verify in the returned JSON that EVERY bill you cite actually meets ALL requested criteria. Do NOT silently drop a criterion or substitute passed/enacted status for bipartisan index.
-4. For committee passage rates, bottlenecks, or referrals, ALWAYS call get_committee_stats — never estimate or fabricate committee rates from keyword trends.
+3. RESPECT EVERY CRITERION in the user's question. If the user asks for multiple criteria (e.g., BOTH high influence score AND high bipartisan index), pass minInfluenceScore / minBipartisanIndex / sortBy="influence_and_bipartisan" and verify in the returned JSON that EVERY bill you cite actually meets ALL requested criteria. Do NOT silently drop a criterion or substitute passed/enacted status for bipartisan index. For "high bipartisan" without an explicit number, use minBipartisanIndex around 0.35 (not 0.7+) since 0.40-0.60 is already strongly bipartisan in Texas.
+4. For committee passage rates, bottlenecks, or referrals, ALWAYS call get_committee_stats — never estimate or fabricate committee rates from keyword trends. Leave includeProcedural=false unless the user specifically asks about Calendars or procedural committees.
 5. For session-specific counts, ALWAYS cite totalBillsInScope for that session (NEVER confuse totalBillsAllSessions with a single session's count!).
 6. Note that 90R is the upcoming/active 90th Legislature; bills in 90R are "Active" and have not died at sine die.
 7. Present crisp, structured answers using concise markdown headings and bullet points with exact numbers, bill numbers, influence/bipartisan metrics when relevant, and legislator names.`;
@@ -2199,6 +2325,10 @@ export async function runResearchAgent(input: {
   const question = input.question.trim();
   const sessionScope = normalizeSessionCode(input.sessionScope || '');
   const explicitUserSession = detectSessionFromQuestion(question, sessionScope);
+  const userSpecifiedBipartisanCutoff =
+    /\b0?\.\d+\b/.test(question) || /\b\d{1,2}\s*%/.test(question);
+  const userAskedProceduralCommittee =
+    /\b(calendar|calendars|procedural|administration|rules\s*(?:&|and)\s*resolutions)\b/i.test(question);
   const cfg = getLocalLlmConfig();
   const ctx: AgentExecutionContext = {
     citedBillsMap: new Map(),
@@ -2206,7 +2336,10 @@ export async function runResearchAgent(input: {
     traces: [],
   };
 
-  // Code-level guardrail: prevent 7B models from hallucinating session="89R" when neither the user nor UI filter requested a session
+  // Code-level guardrails:
+  // 1) Prevent 7B models from hallucinating session="89R" when neither the user nor UI filter requested a session
+  // 2) Clamp overly strict unrequested bipartisan thresholds (e.g. LLM guessing 0.7) down to 0.35 so 0.4-0.6 bills qualify
+  // 3) Exclude procedural committees (House Calendars) by default unless the user explicitly asked about them
   const sanitizeToolArgs = (name: string, rawArgs: Record<string, unknown>): Record<string, unknown> => {
     const args = { ...rawArgs };
     if (
@@ -2216,6 +2349,22 @@ export async function runResearchAgent(input: {
         delete args.session;
       } else if (explicitUserSession && !args.session) {
         args.session = explicitUserSession;
+      }
+    }
+    if (name === 'search_and_count_bills') {
+      if (
+        !userSpecifiedBipartisanCutoff &&
+        args.minBipartisanIndex !== undefined &&
+        Number(args.minBipartisanIndex) > 0.45
+      ) {
+        args.minBipartisanIndex = 0.35;
+      }
+    }
+    if (name === 'get_committee_stats') {
+      if (userAskedProceduralCommittee && args.includeProcedural === undefined) {
+        args.includeProcedural = true;
+      } else if (!userAskedProceduralCommittee && args.includeProcedural === true) {
+        args.includeProcedural = false;
       }
     }
     return args;

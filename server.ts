@@ -3,7 +3,7 @@ import http from 'http';
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
-import { db, DB_PATH, dbExistedBeforeOpen, initSchema } from './src/server/db.ts';
+import { backfillBipartisanIndices, db, DB_PATH, dbExistedBeforeOpen, initSchema } from './src/server/db.ts';
 import { seedDatabaseIfEmpty } from './src/server/seed.ts';
 import { apiRouter } from './src/server/routes.ts';
 import { cancelTloSyncJob, getLatestRunningTloSyncJob } from './src/server/tloFtp.ts';
@@ -11,6 +11,10 @@ import { cancelTloSyncJob, getLatestRunningTloSyncJob } from './src/server/tloFt
 async function startServer() {
   initSchema();
   seedDatabaseIfEmpty();
+  const bpBackfilled = backfillBipartisanIndices();
+  if (bpBackfilled > 0) {
+    console.log(`Computed bipartisan_index for ${bpBackfilled} indexed bill(s)`);
+  }
 
   const app = express();
   const httpServer = http.createServer(app);

@@ -447,23 +447,137 @@ const STAGE_WEIGHTS: Record<string, number> = {
   Stalled: 12,
 };
 
+const PROCEDURAL_COMMITTEE_PATTERNS: RegExp[] = [
+  /\bcalendars?\b/i,
+  /^(?:house|senate)?\s*administration$/i,
+  /\brules\s*(?:&|and)\s*resolutions\b/i,
+];
+
+export function isProceduralCommittee(name: string): boolean {
+  const cleaned = String(name || '').trim();
+  if (!cleaned) return false;
+  return PROCEDURAL_COMMITTEE_PATTERNS.some((re) => re.test(cleaned));
+}
+
+function normalizePartyLookupKey(raw: string): string {
+  return String(raw || '')
+    .replace(/^(?:rep\.|sen\.|representative|senator)\s+/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function buildPoliticianPartyLookup(): Map<string, 'R' | 'D'> {
+  const rows = db
+    .prepare(`SELECT name, short_name, party FROM politicians WHERE party IN ('R', 'D')`)
+    .all() as Array<{ name: string; short_name: string; party: 'R' | 'D' }>;
+
+  const map = new Map<string, 'R' | 'D'>();
+  const surnameCounts = new Map<string, Set<'R' | 'D'>>();
+
+  for (const r of rows) {
+    const shortKey = normalizePartyLookupKey(r.short_name);
+    const fullKey = normalizePartyLookupKey(r.name);
+    if (shortKey) map.set(shortKey, r.party);
+    if (fullKey) map.set(fullKey, r.party);
+
+    // Track surname (before comma or last whitespace token) when party is unambiguous
+    const surname = shortKey.includes(',')
+      ? shortKey.split(',')[0].trim()
+      : fullKey.split(' ').pop()?.trim() || '';
+    if (surname && surname.length >= 3) {
+      if (!surnameCounts.has(surname)) surnameCounts.set(surname, new Set());
+      surnameCounts.get(surname)!.add(r.party);
+    }
+  }
+
+  for (const [surname, parties] of surnameCounts.entries()) {
+    if (parties.size === 1 && !map.has(surname)) {
+      map.set(surname, Array.from(parties)[0]);
+    }
+  }
+
+  return map;
+}
+
+function resolveMemberParty(rawName: string, partyMap: Map<string, 'R' | 'D'>): 'R' | 'D' | null {
+  const key = normalizePartyLookupKey(rawName);
+  if (!key) return null;
+  const direct = partyMap.get(key);
+  if (direct) return direct;
+  if (key.includes(',')) {
+    const surname = key.split(',')[0].trim();
+    const bySurname = partyMap.get(surname);
+    if (bySurname) return bySurname;
+  } else {
+    const last = key.split(' ').pop()?.trim() || '';
+    const byLast = partyMap.get(last);
+    if (byLast) return byLast;
+  }
+  return null;
+}
+
+export function computeBillBipartisanIndex(
+  members: {
+    primaryAuthor?: string;
+    coauthors?: string[];
+    sponsors?: string[];
+    cosponsors?: string[];
+  },
+  partyMap: Map<string, 'R' | 'D'>
+): { score: number; knownMembers: number; rCount: number; dCount: number } {
+  const seen = new Set<string>();
+  const allNames = [
+    members.primaryAuthor || '',
+    ...(members.coauthors || []),
+    ...(members.sponsors || []),
+    ...(members.cosponsors || []),
+  ];
+
+  let rCount = 0;
+  let dCount = 0;
+
+  for (const raw of allNames) {
+    const norm = normalizePartyLookupKey(raw);
+    if (!norm || seen.has(norm)) continue;
+    seen.add(norm);
+    const party = resolveMemberParty(raw, partyMap);
+    if (party === 'R') rCount += 1;
+    else if (party === 'D') dCount += 1;
+  }
+
+  const knownMembers = rCount + dCount;
+  if (rCount === 0 || dCount === 0) {
+    return { score: 0, knownMembers, rCount, dCount };
+  }
+
+  // 2 * min(R, D) / total = 1.0 at 50/50 split, 0.67 at 2:1, 0.50 at 3:1, 0.40 at 4:1
+  const balance = (2 * Math.min(rCount, dCount)) / knownMembers;
+  const coalitionFactor = Math.min(1, knownMembers / 5);
+  const score = Number(Math.min(0.98, balance * 0.85 + coalitionFactor * 0.15).toFixed(2));
+  return { score, knownMembers, rCount, dCount };
+}
+
 export function recomputeBillMetrics(billId: string): void {
   const bill = db
     .prepare(
-      `SELECT id, coauthors_json, cosponsors_json, stage, primary_author FROM bills WHERE id = ?`
+      `SELECT id, coauthors_json, sponsors_json, cosponsors_json, stage, primary_author, bipartisan_index FROM bills WHERE id = ?`
     )
     .get(billId) as
     | {
         id: string;
         coauthors_json: string;
+        sponsors_json: string;
         cosponsors_json: string;
         stage: string;
         primary_author: string;
+        bipartisan_index: number;
       }
     | undefined;
   if (!bill) return;
 
   const coauthors = JSON.parse(bill.coauthors_json || '[]') as string[];
+  const sponsors = JSON.parse(bill.sponsors_json || '[]') as string[];
   const cosponsors = JSON.parse(bill.cosponsors_json || '[]') as string[];
   const amendCount = (
     db.prepare(`SELECT COUNT(*) AS c FROM amendments WHERE bill_id = ?`).get(billId) as { c: number }
@@ -529,15 +643,99 @@ export function recomputeBillMetrics(billId: string): void {
     momentumLabel = '90th Pre-File';
   }
 
+  const partyMap = buildPoliticianPartyLookup();
+  const bp = computeBillBipartisanIndex(
+    {
+      primaryAuthor: bill.primary_author,
+      coauthors,
+      sponsors,
+      cosponsors,
+    },
+    partyMap
+  );
+  // Preserve pre-existing curated bipartisan_index if fewer than 2 members matched our party roster
+  const nextBipartisanIndex =
+    bp.score > 0
+      ? bp.score
+      : bp.knownMembers >= 2 && Number(bill.bipartisan_index || 0) === 0
+        ? 0
+        : Number(bill.bipartisan_index || 0);
+
   db.prepare(
     `UPDATE bills
      SET influence_score = ?,
          influence_breakdown_json = ?,
          momentum_label = ?,
          amendment_count = ?,
-         action_count = ?
+         action_count = ?,
+         bipartisan_index = ?
      WHERE id = ?`
-  ).run(total, JSON.stringify(breakdown), momentumLabel, amendCount, actionCount, billId);
+  ).run(total, JSON.stringify(breakdown), momentumLabel, amendCount, actionCount, nextBipartisanIndex, billId);
+}
+
+export function backfillBipartisanIndices(): number {
+  const partyMap = buildPoliticianPartyLookup();
+  if (partyMap.size === 0) return 0;
+
+  const candidates = db
+    .prepare(
+      `SELECT id, primary_author, coauthors_json, sponsors_json, cosponsors_json
+       FROM bills
+       WHERE bipartisan_index = 0
+         AND (coauthors_json != '[]' OR sponsors_json != '[]' OR cosponsors_json != '[]')`
+    )
+    .all() as Array<{
+    id: string;
+    primary_author: string;
+    coauthors_json: string;
+    sponsors_json: string;
+    cosponsors_json: string;
+  }>;
+
+  if (candidates.length === 0) return 0;
+
+  const updStmt = db.prepare(`UPDATE bills SET bipartisan_index = ? WHERE id = ?`);
+  let updated = 0;
+
+  const tx = db.transaction(() => {
+    for (const row of candidates) {
+      let coauthors: string[] = [];
+      let sponsors: string[] = [];
+      let cosponsors: string[] = [];
+      try {
+        coauthors = JSON.parse(row.coauthors_json || '[]');
+      } catch {
+        coauthors = [];
+      }
+      try {
+        sponsors = JSON.parse(row.sponsors_json || '[]');
+      } catch {
+        sponsors = [];
+      }
+      try {
+        cosponsors = JSON.parse(row.cosponsors_json || '[]');
+      } catch {
+        cosponsors = [];
+      }
+
+      const bp = computeBillBipartisanIndex(
+        {
+          primaryAuthor: row.primary_author,
+          coauthors,
+          sponsors,
+          cosponsors,
+        },
+        partyMap
+      );
+      if (bp.score > 0) {
+        updStmt.run(bp.score, row.id);
+        updated += 1;
+      }
+    }
+  });
+
+  tx();
+  return updated;
 }
 
 export function refreshSessionCounts(): void {
