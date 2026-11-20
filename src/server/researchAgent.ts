@@ -42,7 +42,6 @@ export async function checkLocalLlmReachable(timeoutMs = 2800): Promise<{
   try {
     const headers: Record<string, string> = {};
     if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`;
-    // Any HTTP response (even 401/404) confirms the server socket is reachable
     await fetch(cfg.modelsUrl, {
       method: 'GET',
       headers,
@@ -121,7 +120,7 @@ function classifyOutcome(
   }
 
   if (!isPreviousSession) {
-    return { outcome: 'Active', outcomeDetail: stage || 'In Progress' };
+    return { outcome: 'Active', outcomeDetail: `Active · ${stage || 'In Progress'}` };
   }
 
   if (combined.includes('conference') || combined.includes('impasse')) {
@@ -176,7 +175,19 @@ const POLICY_EXPANSIONS: PolicyExpansion[] = [
   },
   {
     triggers: ['autonomous', 'self-driving', 'self driving', 'driverless', 'automated vehicle', 'automated motor'],
-    billTerms: ['autonomous', 'automated motor vehicle', 'automated vehicle', 'self-driving', 'driverless', 'waymo', 'robotaxi', 'automated driving'],
+    // Keep strictly vehicle-specific phrases so bare "autonomous" never matches unrelated education/governance bills
+    billTerms: [
+      'autonomous vehicle',
+      'autonomous vehicles',
+      'autonomous driving',
+      'autonomous motor vehicle',
+      'automated motor vehicle',
+      'automated vehicle',
+      'automated driving system',
+      'self-driving',
+      'driverless',
+      'robotaxi',
+    ],
     committeeTerms: ['transportation', 'business', 'state affairs', 'licensing'],
     donorSectors: ['transportation', 'auto', 'tech', 'mobility', 'insurance'],
     fiscalRelevant: false,
@@ -228,27 +239,63 @@ function findPolicyExpansion(topic: string): PolicyExpansion | null {
   return null;
 }
 
-function buildFtsFromNaturalText(raw: string): string {
+const STOP_WORDS = new Set([
+  'the',
+  'and',
+  'for',
+  'with',
+  'about',
+  'from',
+  'into',
+  'over',
+  'have',
+  'been',
+  'that',
+  'this',
+  'bill',
+  'bills',
+  'policy',
+  'texas',
+  'legislature',
+  'session',
+  'sessions',
+]);
+
+function extractQueryTokens(raw: string): string[] {
   const cleaned = raw
     .replace(/['"`*?()[\]{}:^~]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  if (!cleaned) return '';
-  const tokens = cleaned
+  if (!cleaned) return [];
+  return cleaned
     .split(/\s+/)
     .map((t) => t.trim())
-    .filter((t) => t.length >= 2 && !['the', 'and', 'for', 'with', 'about', 'from', 'into', 'over', 'have', 'been', 'that', 'this', 'bill', 'bills', 'policy', 'texas'].includes(t.toLowerCase()));
-  if (tokens.length === 0) return '';
-  if (tokens.length === 1) return `"${tokens[0]}"*`;
-  return tokens.map((t) => `"${t}"*`).join(' AND ');
+    .filter((t) => t.length >= 2 && !STOP_WORDS.has(t.toLowerCase()));
 }
 
-function buildOrFtsFromTerms(terms: string[]): string {
+function buildFtsFromNaturalText(raw: string, metadataColumnsOnly = true): string {
+  const tokens = extractQueryTokens(raw);
+  if (tokens.length === 0) return '';
+  const expr =
+    tokens.length === 1
+      ? tokens[0].length < 5
+        ? `"${tokens[0]}"`
+        : `"${tokens[0]}"*`
+      : tokens.map((t) => (t.length < 5 ? `"${t}"` : `"${t}"*`)).join(' AND ');
+  // Restrict bills_fts matches to metadata columns (title, summary, subjects, statute_codes)
+  // so incidental words buried inside long full_text excerpts do not cause cross-topic leakage.
+  return metadataColumnsOnly ? `{title summary subjects statute_codes} : (${expr})` : expr;
+}
+
+function buildOrFtsFromTerms(terms: string[], metadataColumnsOnly = true): string {
   const parts = terms
     .map((t) => t.replace(/['"`*?()[\]{}:^~]/g, ' ').trim())
     .filter((t) => t.length >= 3)
     .map((t) => (t.includes(' ') || t.length < 5 ? `"${t}"` : `"${t}"*`));
-  return Array.from(new Set(parts)).join(' OR ');
+  const unique = Array.from(new Set(parts));
+  if (unique.length === 0) return '';
+  const expr = unique.join(' OR ');
+  return metadataColumnsOnly ? `{title summary subjects statute_codes} : (${expr})` : expr;
 }
 
 interface BillDbRow {
@@ -271,6 +318,7 @@ interface BillDbRow {
   last_action_date: string;
   filed_date: string;
   influence_score: number;
+  bipartisan_index: number;
   amendment_count: number;
   action_count: number;
   full_text: string;
@@ -343,6 +391,18 @@ function registerPoliticianCitation(
   return entry;
 }
 
+function normalizeSessionCode(raw: string): string {
+  const s = safeStr(raw).trim().toUpperCase();
+  if (!s) return '';
+  if (s === 'ALL' || s === 'ALL SESSIONS') return '';
+  // Normalize "89-1" -> "891", "89TH" -> "89R"
+  const called = s.match(/^(\d{2})[-_](\d)$/);
+  if (called) return `${called[1]}${called[2]}`;
+  const ord = s.match(/^(\d{2})(?:ST|ND|RD|TH)$/);
+  if (ord) return `${ord[1]}R`;
+  return s;
+}
+
 // ============================================================================
 // DETERMINISTIC RESEARCH TOOLS
 // ============================================================================
@@ -351,7 +411,7 @@ function toolGetArchiveOverview(
   args: { session?: string },
   _ctx: AgentExecutionContext
 ): { payload: Record<string, unknown>; summary: string; resultCount: number } {
-  const sessionFilter = safeStr(args.session).trim().toUpperCase();
+  const sessionFilter = normalizeSessionCode(args.session || '');
   const billRows = db
     .prepare(
       `SELECT id, session, stage, status, last_action, committees_json
@@ -368,11 +428,25 @@ function toolGetArchiveOverview(
 
   const bySession = new Map<
     string,
-    { session: string; total: number; passed: number; failed: number; vetoed: number; active: number }
+    {
+      session: string;
+      total: number;
+      passed: number;
+      failed: number;
+      vetoed: number;
+      active: number;
+      diedInCommittee: number;
+    }
   >();
   for (const r of billRows) {
     const committees = safeJsonArray(r.committees_json);
-    const { outcome } = classifyOutcome(r.session, r.stage, r.status, r.last_action, committees.length);
+    const { outcome, outcomeDetail } = classifyOutcome(
+      r.session,
+      r.stage,
+      r.status,
+      r.last_action,
+      committees.length
+    );
     const cur = bySession.get(r.session) || {
       session: r.session,
       total: 0,
@@ -380,37 +454,63 @@ function toolGetArchiveOverview(
       failed: 0,
       vetoed: 0,
       active: 0,
+      diedInCommittee: 0,
     };
     cur.total += 1;
     if (outcome === 'Passed') cur.passed += 1;
-    else if (outcome === 'Failed') cur.failed += 1;
-    else if (outcome === 'Vetoed') cur.vetoed += 1;
+    else if (outcome === 'Failed') {
+      cur.failed += 1;
+      if (outcomeDetail.toLowerCase().includes('died in committee')) cur.diedInCommittee += 1;
+    } else if (outcome === 'Vetoed') cur.vetoed += 1;
     else cur.active += 1;
     bySession.set(r.session, cur);
   }
 
   const sessions = Array.from(bySession.values()).sort((a, b) => b.session.localeCompare(a.session));
+  const totalBillsAllSessions = (db.prepare(`SELECT COUNT(*) AS c FROM bills`).get() as { c: number }).c;
   const politiciansCount = (db.prepare(`SELECT COUNT(*) AS c FROM politicians`).get() as { c: number }).c;
   const committeesCount = (db.prepare(`SELECT COUNT(*) AS c FROM committees`).get() as { c: number }).c;
   const statutesCount = (db.prepare(`SELECT COUNT(*) AS c FROM statute_sections`).get() as { c: number }).c;
 
   return {
     payload: {
-      totalBillsIndexed: billRows.length,
+      scope: sessionFilter || 'ALL SESSIONS',
+      totalBillsInScope: billRows.length,
+      totalBillsAllSessions,
       politiciansIndexed: politiciansCount,
       committeesIndexed: committeesCount,
       statuteSectionsIndexed: statutesCount,
       sessions,
     },
-    summary: `${billRows.length} bills indexed across ${sessions.length} session(s), ${politiciansCount} legislators, ${committeesCount} committees`,
+    summary: sessionFilter
+      ? `${billRows.length} bills indexed in ${sessionFilter} (${totalBillsAllSessions} total across all sessions)`
+      : `${billRows.length} bills indexed across ${sessions.length} session(s), ${politiciansCount} legislators, ${committeesCount} committees`,
     resultCount: billRows.length,
   };
 }
 
+function billMetadataContainsTokens(row: BillDbRow, tokens: string[]): boolean {
+  const hay = `${row.title} ${row.summary} ${row.subjects_json} ${row.statute_codes}`.toLowerCase();
+  return tokens.every((t) => hay.includes(t.toLowerCase()));
+}
+
+function billMetadataContainsAnyPhrase(row: BillDbRow, phrases: string[]): boolean {
+  const hay = `${row.title} ${row.summary} ${row.subjects_json} ${row.statute_codes}`.toLowerCase();
+  return phrases.some((p) => hay.includes(p.toLowerCase()));
+}
+
 function queryBillsMatchingText(
   query: string,
-  filters: { session?: string; chamber?: string; stage?: string; author?: string }
-): { rows: BillDbRow[]; matchMode: 'exact_fts' | 'expanded_fts' | 'all_filtered' } {
+  filters: {
+    session?: string;
+    chamber?: string;
+    stage?: string;
+    author?: string;
+    minInfluenceScore?: number;
+    minBipartisanIndex?: number;
+    includeFullText?: boolean;
+  }
+): { rows: BillDbRow[]; matchMode: 'exact_metadata_fts' | 'expanded_metadata_fts' | 'all_filtered' } {
   const conditions: string[] = [];
   const params: Array<string | number> = [];
   if (filters.session) {
@@ -432,8 +532,18 @@ function queryBillsMatchingText(
     const pat = `%${filters.author}%`;
     params.push(pat, pat, pat);
   }
+  if (filters.minInfluenceScore !== undefined && Number.isFinite(filters.minInfluenceScore)) {
+    conditions.push('b.influence_score >= ?');
+    params.push(filters.minInfluenceScore);
+  }
+  if (filters.minBipartisanIndex !== undefined && Number.isFinite(filters.minBipartisanIndex)) {
+    conditions.push('b.bipartisan_index >= ?');
+    params.push(filters.minBipartisanIndex);
+  }
 
+  const metadataOnly = !filters.includeFullText;
   const trimmed = query.trim();
+
   if (!trimmed) {
     const whereSql = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const rows = db
@@ -442,12 +552,14 @@ function queryBillsMatchingText(
     return { rows, matchMode: 'all_filtered' };
   }
 
-  // 1. Try precise FTS5 query first
-  const ftsStrict = buildFtsFromNaturalText(trimmed);
+  const tokens = extractQueryTokens(trimmed);
+
+  // 1. Try column-restricted FTS5 query (title, summary, subjects, statute_codes — excludes full_text)
+  const ftsStrict = buildFtsFromNaturalText(trimmed, metadataOnly);
   if (ftsStrict) {
     try {
       const whereSql = conditions.length ? `AND ${conditions.join(' AND ')}` : '';
-      const rows = db
+      const rawRows = db
         .prepare(
           `SELECT b.*
            FROM bills_fts
@@ -456,20 +568,24 @@ function queryBillsMatchingText(
            ORDER BY b.influence_score DESC, b.last_action_date DESC`
         )
         .all(ftsStrict, ...params) as BillDbRow[];
-      if (rows.length > 0) {
-        return { rows, matchMode: 'exact_fts' };
+      const verified =
+        metadataOnly && tokens.length > 0
+          ? rawRows.filter((r) => billMetadataContainsTokens(r, tokens))
+          : rawRows;
+      if (verified.length > 0) {
+        return { rows: verified, matchMode: 'exact_metadata_fts' };
       }
     } catch {
-      // Fall through to LIKE/synonym matching
+      // Fall through to LIKE metadata matching
     }
   }
 
-  // 2. Fallback to substring LIKE on exact trimmed phrase
+  // 2. Fallback to substring LIKE strictly on metadata fields (title, summary, subjects_json, statute_codes)
   {
-    const likeCond = [
-      ...conditions,
-      `(LOWER(b.title) LIKE LOWER(?) OR LOWER(b.summary) LIKE LOWER(?) OR LOWER(b.subjects_json) LIKE LOWER(?) OR LOWER(b.full_text) LIKE LOWER(?))`,
-    ];
+    const likeExpr = metadataOnly
+      ? `(LOWER(b.title) LIKE LOWER(?) OR LOWER(b.summary) LIKE LOWER(?) OR LOWER(b.subjects_json) LIKE LOWER(?) OR LOWER(b.statute_codes) LIKE LOWER(?))`
+      : `(LOWER(b.title) LIKE LOWER(?) OR LOWER(b.summary) LIKE LOWER(?) OR LOWER(b.subjects_json) LIKE LOWER(?) OR LOWER(b.full_text) LIKE LOWER(?))`;
+    const likeCond = [...conditions, likeExpr];
     const pat = `%${trimmed}%`;
     const rows = db
       .prepare(
@@ -477,18 +593,18 @@ function queryBillsMatchingText(
       )
       .all(...params, pat, pat, pat, pat) as BillDbRow[];
     if (rows.length > 0) {
-      return { rows, matchMode: 'exact_fts' };
+      return { rows, matchMode: 'exact_metadata_fts' };
     }
   }
 
-  // 3. Domain synonym expansion if the topic has known statutory aliases (e.g. autonomous driving -> automated motor vehicle)
+  // 3. Domain synonym expansion — still strictly restricted to metadata columns (never full_text)
   const exp = findPolicyExpansion(trimmed);
   if (exp) {
-    const ftsExpanded = buildOrFtsFromTerms(exp.billTerms);
+    const ftsExpanded = buildOrFtsFromTerms(exp.billTerms, metadataOnly);
     if (ftsExpanded) {
       try {
         const whereSql = conditions.length ? `AND ${conditions.join(' AND ')}` : '';
-        const rows = db
+        const rawRows = db
           .prepare(
             `SELECT b.*
              FROM bills_fts
@@ -497,8 +613,11 @@ function queryBillsMatchingText(
              ORDER BY b.influence_score DESC, b.last_action_date DESC`
           )
           .all(ftsExpanded, ...params) as BillDbRow[];
-        if (rows.length > 0) {
-          return { rows, matchMode: 'expanded_fts' };
+        const verified = metadataOnly
+          ? rawRows.filter((r) => billMetadataContainsAnyPhrase(r, exp.billTerms))
+          : rawRows;
+        if (verified.length > 0) {
+          return { rows: verified, matchMode: 'expanded_metadata_fts' };
         }
       } catch {
         // ignore
@@ -506,7 +625,7 @@ function queryBillsMatchingText(
     }
   }
 
-  return { rows: [], matchMode: 'exact_fts' };
+  return { rows: [], matchMode: 'exact_metadata_fts' };
 }
 
 function toolSearchAndCountBills(
@@ -515,18 +634,32 @@ function toolSearchAndCountBills(
     session?: string;
     chamber?: string;
     outcome?: string;
+    disposition?: string;
     stage?: string;
     author?: string;
+    minInfluenceScore?: number;
+    minBipartisanIndex?: number;
+    sortBy?: 'influence' | 'bipartisan' | 'influence_and_bipartisan' | 'amendments' | 'recent';
     limit?: number;
   },
   ctx: AgentExecutionContext
 ): { payload: Record<string, unknown>; summary: string; resultCount: number } {
   const query = safeStr(args.query).trim();
-  const session = safeStr(args.session).trim();
+  const session = normalizeSessionCode(args.session || '');
   const chamber = safeStr(args.chamber).trim();
   const outcomeFilter = safeStr(args.outcome).trim().toLowerCase();
+  const dispositionFilter = safeStr(args.disposition).trim().toLowerCase().replace(/_/g, ' ');
   const stage = safeStr(args.stage).trim();
   const author = safeStr(args.author).trim();
+  const minInfluenceScore =
+    args.minInfluenceScore !== undefined && args.minInfluenceScore !== null && args.minInfluenceScore !== ('' as unknown)
+      ? Number(args.minInfluenceScore)
+      : undefined;
+  const minBipartisanIndex =
+    args.minBipartisanIndex !== undefined && args.minBipartisanIndex !== null && args.minBipartisanIndex !== ('' as unknown)
+      ? Number(args.minBipartisanIndex)
+      : undefined;
+  const sortBy = args.sortBy || 'influence';
   const limit = Math.min(25, Math.max(1, Number(args.limit) || 12));
 
   const { rows: rawRows, matchMode } = queryBillsMatchingText(query, {
@@ -534,6 +667,9 @@ function toolSearchAndCountBills(
     chamber: chamber || undefined,
     stage: stage || undefined,
     author: author || undefined,
+    minInfluenceScore: Number.isFinite(minInfluenceScore) ? minInfluenceScore : undefined,
+    minBipartisanIndex: Number.isFinite(minBipartisanIndex) ? minBipartisanIndex : undefined,
+    includeFullText: false,
   });
 
   const enriched = rawRows.map((row) => {
@@ -548,9 +684,36 @@ function toolSearchAndCountBills(
     return { row, committees, outcome, outcomeDetail };
   });
 
-  const filtered = outcomeFilter
-    ? enriched.filter((e) => e.outcome.toLowerCase() === outcomeFilter)
-    : enriched;
+  let filtered = enriched;
+  if (outcomeFilter) {
+    filtered = filtered.filter((e) => e.outcome.toLowerCase() === outcomeFilter);
+  }
+  if (dispositionFilter) {
+    filtered = filtered.filter((e) => e.outcomeDetail.toLowerCase().includes(dispositionFilter));
+  }
+
+  // Apply explicit sorting requested by the user/LLM
+  if (sortBy === 'bipartisan') {
+    filtered.sort(
+      (a, b) =>
+        (b.row.bipartisan_index || 0) - (a.row.bipartisan_index || 0) ||
+        (b.row.influence_score || 0) - (a.row.influence_score || 0)
+    );
+  } else if (sortBy === 'influence_and_bipartisan') {
+    filtered.sort((a, b) => {
+      const scoreA = (a.row.influence_score || 0) * 0.6 + (a.row.bipartisan_index || 0) * 40;
+      const scoreB = (b.row.influence_score || 0) * 0.6 + (b.row.bipartisan_index || 0) * 40;
+      return scoreB - scoreA;
+    });
+  } else if (sortBy === 'amendments') {
+    filtered.sort(
+      (a, b) =>
+        (b.row.amendment_count || 0) - (a.row.amendment_count || 0) ||
+        (b.row.influence_score || 0) - (a.row.influence_score || 0)
+    );
+  } else if (sortBy === 'recent') {
+    filtered.sort((a, b) => (b.row.last_action_date || '').localeCompare(a.row.last_action_date || ''));
+  }
 
   const bySessionMap = new Map<
     string,
@@ -558,6 +721,7 @@ function toolSearchAndCountBills(
   >();
   const byChamber = { House: 0, Senate: 0 };
   const byOutcome = { Passed: 0, Failed: 0, Vetoed: 0, Active: 0 };
+  const byDisposition = new Map<string, number>();
   const authorCounts = new Map<string, number>();
   const committeeCounts = new Map<string, number>();
 
@@ -582,6 +746,7 @@ function toolSearchAndCountBills(
     else if (item.row.chamber === 'Senate') byChamber.Senate += 1;
 
     byOutcome[item.outcome] += 1;
+    byDisposition.set(item.outcomeDetail, (byDisposition.get(item.outcomeDetail) ?? 0) + 1);
 
     if (item.row.primary_author) {
       authorCounts.set(item.row.primary_author, (authorCounts.get(item.row.primary_author) ?? 0) + 1);
@@ -606,23 +771,50 @@ function toolSearchAndCountBills(
       outcome,
       outcomeDetail,
       primaryAuthor: row.primary_author,
-      influenceScore: Number(row.influence_score.toFixed(1)),
+      influenceScore: Number((row.influence_score || 0).toFixed(1)),
+      bipartisanIndex: Number((row.bipartisan_index || 0).toFixed(2)),
+      amendmentCount: row.amendment_count || 0,
       filedDate: row.filed_date,
       lastActionDate: row.last_action_date,
     };
   });
 
-  const totalIndexedBills = (db.prepare(`SELECT COUNT(*) AS c FROM bills`).get() as { c: number }).c;
+  // Compute BOTH the session-scoped total (when session is specified) AND the overall archive total
+  const totalBillsInScope = session
+    ? (db.prepare(`SELECT COUNT(*) AS c FROM bills WHERE UPPER(session) = UPPER(?)`).get(session) as { c: number }).c
+    : (db.prepare(`SELECT COUNT(*) AS c FROM bills`).get() as { c: number }).c;
+  const totalBillsAllSessions = (db.prepare(`SELECT COUNT(*) AS c FROM bills`).get() as { c: number }).c;
+
+  const isUpcomingSession = session ? parseInt(session, 10) >= 90 : false;
 
   const payload = {
-    query: query || '(all bills)',
+    query: query || '(all bills matching filters)',
+    searchColumns: 'title, summary, subjects, statute_codes (excludes full_text)',
     matchMode,
-    filters: { session: session || 'ALL', chamber: chamber || 'ALL', outcome: outcomeFilter || 'ALL' },
+    filters: {
+      session: session || 'ALL SESSIONS',
+      chamber: chamber || 'ALL',
+      outcome: outcomeFilter || 'ALL',
+      disposition: dispositionFilter || 'ALL',
+      stage: stage || 'ALL',
+      minInfluenceScore: Number.isFinite(minInfluenceScore) ? minInfluenceScore : null,
+      minBipartisanIndex: Number.isFinite(minBipartisanIndex) ? minBipartisanIndex : null,
+      sortBy,
+    },
     totalMatches: filtered.length,
-    totalIndexedBillsInArchive: totalIndexedBills,
+    totalBillsInScope,
+    totalBillsAllSessions,
+    ...(isUpcomingSession
+      ? {
+          sessionNote: `${session} is the upcoming/active 90th Legislature (pre-filing/in-progress). Bills in ${session} have outcome "Active" and have not died at sine die.`,
+        }
+      : {}),
     bySession: Array.from(bySessionMap.values()).sort((a, b) => b.session.localeCompare(a.session)),
     byChamber,
     byOutcome,
+    byDisposition: Object.fromEntries(
+      Array.from(byDisposition.entries()).sort((a, b) => b[1] - a[1])
+    ),
     topAuthors: Array.from(authorCounts.entries())
       .sort((a, b) => b[1] - a[1])
       .slice(0, 8)
@@ -634,13 +826,244 @@ function toolSearchAndCountBills(
     bills: topBills,
   };
 
+  const scopeLabel = session ? `in ${session} (${totalBillsInScope} bills in ${session})` : `across all sessions (${totalBillsInScope} total)`;
+
   return {
     payload,
     summary:
       filtered.length === 0
-        ? `0 bills matched "${query || 'filter'}" (out of ${totalIndexedBills} indexed)`
-        : `${filtered.length} matching bill${filtered.length === 1 ? '' : 's'} (${byOutcome.Passed} passed, ${byOutcome.Failed} failed, ${byOutcome.Active} active)`,
+        ? `0 bills matched ${query ? `"${query}"` : 'criteria'} ${scopeLabel}`
+        : `${filtered.length} matching bill${filtered.length === 1 ? '' : 's'} ${scopeLabel} (${byOutcome.Passed} passed, ${byOutcome.Failed} failed, ${byOutcome.Active} active)`,
     resultCount: filtered.length,
+  };
+}
+
+function toolGetCommitteeStats(
+  args: {
+    query?: string;
+    chamber?: string;
+    session?: string;
+    sortBy?: 'bottleneck' | 'most_referred' | 'highest_passage';
+    limit?: number;
+  },
+  ctx: AgentExecutionContext
+): { payload: Record<string, unknown>; summary: string; resultCount: number } {
+  const q = safeStr(args.query).trim().toLowerCase();
+  const chamberFilter = safeStr(args.chamber).trim();
+  const sessionFilter = normalizeSessionCode(args.session || '');
+  const sortBy = args.sortBy || 'bottleneck';
+  const limit = Math.min(25, Math.max(1, Number(args.limit) || 12));
+  const expansion = q ? findPolicyExpansion(q) : null;
+
+  const billRows = db
+    .prepare(
+      `SELECT id, session, chamber, stage, status, last_action, committees_json
+       FROM bills
+       ${sessionFilter ? 'WHERE UPPER(session) = UPPER(?)' : ''}`
+    )
+    .all(...(sessionFilter ? [sessionFilter] : [])) as Array<{
+    id: string;
+    session: string;
+    chamber: Chamber;
+    stage: string;
+    status: string;
+    last_action: string;
+    committees_json: string;
+  }>;
+
+  // Lookup chair/jurisdiction metadata from committees table
+  const commMetaRows = db
+    .prepare(
+      `SELECT c.id, c.name, c.chamber, c.session, c.jurisdiction,
+              p1.id AS chair_pol_id, p1.name AS chair_name, p1.party AS chair_party, p1.district AS chair_district,
+              p2.name AS vice_chair_name
+       FROM committees c
+       LEFT JOIN politicians p1 ON p1.id = c.chair_id
+       LEFT JOIN politicians p2 ON p2.id = c.vice_chair_id`
+    )
+    .all() as Array<{
+    id: string;
+    name: string;
+    chamber: Chamber;
+    session: string;
+    jurisdiction: string;
+    chair_pol_id: string | null;
+    chair_name: string | null;
+    chair_party: string | null;
+    chair_district: string | null;
+    vice_chair_name: string | null;
+  }>;
+
+  const metaByKey = new Map<string, (typeof commMetaRows)[number]>();
+  for (const m of commMetaRows) {
+    metaByKey.set(`${m.chamber.toLowerCase()}::${m.name.toLowerCase()}`, m);
+  }
+
+  interface CommAgg {
+    key: string;
+    chamber: Chamber;
+    name: string;
+    referredCount: number;
+    reportedCount: number;
+    passedCount: number;
+    failedCount: number;
+    diedInCommitteeCount: number;
+    activeCount: number;
+  }
+
+  const aggMap = new Map<string, CommAgg>();
+
+  for (const b of billRows) {
+    const committees = safeJsonArray<{ name?: string; chamber?: Chamber; status?: string }>(b.committees_json);
+    if (committees.length === 0) continue;
+    const { outcome, outcomeDetail } = classifyOutcome(
+      b.session,
+      b.stage,
+      b.status,
+      b.last_action,
+      committees.length
+    );
+
+    const seenInBill = new Set<string>();
+    for (const c of committees) {
+      const cName = safeStr(c.name).trim();
+      if (!cName) continue;
+      const cChamber: Chamber = c.chamber === 'Senate' || c.chamber === 'House' ? c.chamber : b.chamber;
+      if (chamberFilter && cChamber.toLowerCase() !== chamberFilter.toLowerCase()) continue;
+
+      const key = `${cChamber.toLowerCase()}::${cName.toLowerCase()}`;
+      if (seenInBill.has(key)) continue;
+      seenInBill.add(key);
+
+      const cur = aggMap.get(key) || {
+        key,
+        chamber: cChamber,
+        name: cName,
+        referredCount: 0,
+        reportedCount: 0,
+        passedCount: 0,
+        failedCount: 0,
+        diedInCommitteeCount: 0,
+        activeCount: 0,
+      };
+      cur.referredCount += 1;
+
+      const cStatus = safeStr(c.status).toLowerCase();
+      const wasReported =
+        ['Committee Reported', 'Engrossed', 'Enrolled', 'Signed', 'Vetoed'].includes(b.stage) ||
+        cStatus.includes('reported') ||
+        cStatus.includes('passed');
+      if (wasReported) cur.reportedCount += 1;
+
+      if (outcome === 'Passed') cur.passedCount += 1;
+      else if (outcome === 'Failed') {
+        cur.failedCount += 1;
+        if (outcomeDetail.toLowerCase().includes('died in committee')) {
+          cur.diedInCommitteeCount += 1;
+        }
+      } else if (outcome === 'Active') {
+        cur.activeCount += 1;
+      }
+
+      aggMap.set(key, cur);
+    }
+  }
+
+  let rows = Array.from(aggMap.values()).map((a) => {
+    const meta = metaByKey.get(a.key);
+    const completedCount = a.passedCount + a.failedCount;
+    const reportRatePct = a.referredCount > 0 ? Math.round((a.reportedCount / a.referredCount) * 1000) / 10 : 0;
+    const passageRatePct =
+      completedCount > 0
+        ? Math.round((a.passedCount / completedCount) * 1000) / 10
+        : a.referredCount > 0
+          ? Math.round((a.passedCount / a.referredCount) * 1000) / 10
+          : 0;
+
+    return {
+      ...a,
+      reportRatePct,
+      passageRatePct,
+      chair: meta?.chair_name || 'Unassigned',
+      chairPolId: meta?.chair_pol_id || null,
+      chairParty: meta?.chair_party || '—',
+      chairDistrict: meta?.chair_district || '',
+      viceChair: meta?.vice_chair_name || 'Unassigned',
+      jurisdiction: meta?.jurisdiction || '',
+    };
+  });
+
+  if (q) {
+    const matched = rows.filter((r) => {
+      const hay = `${r.chamber} ${r.name} ${r.jurisdiction}`.toLowerCase();
+      if (hay.includes(q)) return true;
+      if (expansion && expansion.committeeTerms.some((t) => hay.includes(t))) return true;
+      return q
+        .split(/\s+/)
+        .filter((w) => w.length >= 3)
+        .some((w) => hay.includes(w));
+    });
+    if (matched.length > 0) rows = matched;
+  }
+
+  if (sortBy === 'bottleneck') {
+    // Lowest passage/report rate first among committees with referrals (preferring substantive volume when tied)
+    rows.sort(
+      (a, b) =>
+        a.passageRatePct - b.passageRatePct ||
+        a.reportRatePct - b.reportRatePct ||
+        b.referredCount - a.referredCount
+    );
+  } else if (sortBy === 'highest_passage') {
+    rows.sort((a, b) => b.passageRatePct - a.passageRatePct || b.referredCount - a.referredCount);
+  } else {
+    rows.sort((a, b) => b.referredCount - a.referredCount || b.passedCount - a.passedCount);
+  }
+
+  const top = rows.slice(0, limit);
+  for (const r of top) {
+    if (r.chairPolId && r.chair && r.chair !== 'Unassigned') {
+      registerPoliticianCitation(ctx, {
+        id: r.chairPolId,
+        name: r.chair,
+        shortName: r.chair,
+        chamber: r.chamber,
+        party: r.chairParty,
+        district: r.chairDistrict,
+        leadershipRole: `Chair, ${r.chamber} ${r.name}`,
+        reason: `${r.referredCount} referred · ${r.passageRatePct}% passage rate`,
+      });
+    }
+  }
+
+  const payload = {
+    scope: sessionFilter || 'ALL SESSIONS',
+    chamberFilter: chamberFilter || 'ALL',
+    query: q || '(all committees)',
+    sortBy,
+    totalBillsEvaluatedInScope: billRows.length,
+    totalCommitteesWithReferrals: rows.length,
+    committees: top.map((r) => ({
+      committee: `${r.chamber} ${r.name}`,
+      chamber: r.chamber,
+      chair: r.chair,
+      viceChair: r.viceChair,
+      jurisdiction: r.jurisdiction,
+      referredCount: r.referredCount,
+      reportedCount: r.reportedCount,
+      passedCount: r.passedCount,
+      failedCount: r.failedCount,
+      diedInCommitteeCount: r.diedInCommitteeCount,
+      activeCount: r.activeCount,
+      reportRatePct: r.reportRatePct,
+      passageRatePct: r.passageRatePct,
+    })),
+  };
+
+  return {
+    payload,
+    summary: `Computed real referral/passage stats for ${rows.length} committee${rows.length === 1 ? '' : 's'} from ${billRows.length} bills${sessionFilter ? ` in ${sessionFilter}` : ''}`,
+    resultCount: top.length,
   };
 }
 
@@ -650,7 +1073,7 @@ function toolRankPolicyInfluence(
 ): { payload: Record<string, unknown>; summary: string; resultCount: number } {
   const topic = safeStr(args.topic).trim();
   const chamberFilter = safeStr(args.chamber).trim();
-  const sessionFilter = safeStr(args.session).trim();
+  const sessionFilter = normalizeSessionCode(args.session || '');
   const limit = Math.min(15, Math.max(3, Number(args.limit) || 8));
 
   const expansion = findPolicyExpansion(topic);
@@ -659,13 +1082,13 @@ function toolRankPolicyInfluence(
     .split(/[^a-z0-9]+/)
     .filter((t) => t.length >= 3 && !['policy', 'bills', 'texas', 'over', 'influence'].includes(t));
 
-  // 1. Find topic-related bills
+  // 1. Find topic-related bills (strictly metadata columns, no full_text leakage)
   const { rows: topicBills, matchMode } = queryBillsMatchingText(topic, {
     session: sessionFilter || undefined,
+    includeFullText: false,
   });
   const topicBillIds = new Set(topicBills.map((b) => b.id));
 
-  // Register top topic bills as citations
   for (const b of topicBills.slice(0, 8)) {
     registerBillCitation(ctx, b);
   }
@@ -778,7 +1201,6 @@ function toolRankPolicyInfluence(
     }
   }
 
-  // Score each politician transparently
   const scored = polRows
     .map((p) => {
       const shortLower = p.short_name.toLowerCase();
@@ -812,7 +1234,6 @@ function toolRankPolicyInfluence(
         }
       }
 
-      // Also inspect leadership_role text directly (helpful for TLO-synced rosters without full membership rows)
       if (matchingComms.length === 0 && p.leadership_role) {
         const matchedKeyword =
           topicTokens.some((t) => bioLeadLower.includes(t)) ||
@@ -885,7 +1306,6 @@ function toolRankPolicyInfluence(
         reasons.push(`$${sectorFunding.toLocaleString()} in related-sector PAC filings`);
       }
 
-      // Small tie-breaker for institutional seniority / bills passed if already relevant
       if (score > 0) {
         score += Math.min(5, p.tenure_years * 0.25) + Math.min(4, p.bills_passed * 0.15);
       }
@@ -923,7 +1343,7 @@ function toolRankPolicyInfluence(
   const payload = {
     topic,
     chamberFilter: chamberFilter || 'Both Chambers',
-    sessionFilter: sessionFilter || 'ALL',
+    sessionFilter: sessionFilter || 'ALL SESSIONS',
     matchingTopicBillsCount: topicBills.length,
     billMatchMode: matchMode,
     relevantCommittees: relevantCommittees.map((c) => ({
@@ -1038,6 +1458,7 @@ function toolGetPoliticianProfile(
       outcome: cited.outcome,
       outcomeDetail: cited.outcomeDetail,
       influenceScore: cited.influenceScore,
+      bipartisanIndex: Number((b.bipartisan_index || 0).toFixed(2)),
     };
   });
 
@@ -1083,7 +1504,7 @@ function toolGetBillDetails(
   ctx: AgentExecutionContext
 ): { payload: Record<string, unknown>; summary: string; resultCount: number } {
   const ref = safeStr(args.billRef).trim();
-  const session = safeStr(args.session).trim().toUpperCase();
+  const session = normalizeSessionCode(args.session || '');
   if (!ref) {
     return { payload: { found: false }, summary: 'No bill reference provided', resultCount: 0 };
   }
@@ -1126,6 +1547,7 @@ function toolGetBillDetails(
       found: true,
       bill: {
         ...cited,
+        bipartisanIndex: Number((row.bipartisan_index || 0).toFixed(2)),
         status: row.status,
         lastAction: row.last_action,
         lastActionDate: row.last_action_date,
@@ -1145,83 +1567,6 @@ function toolGetBillDetails(
   };
 }
 
-function toolSearchCommittees(
-  args: { query?: string; chamber?: string },
-  ctx: AgentExecutionContext
-): { payload: Record<string, unknown>; summary: string; resultCount: number } {
-  const q = safeStr(args.query).trim().toLowerCase();
-  const chamber = safeStr(args.chamber).trim();
-  const expansion = q ? findPolicyExpansion(q) : null;
-
-  const rows = db
-    .prepare(
-      `SELECT c.id, c.name, c.chamber, c.session, c.jurisdiction,
-              p1.id AS chair_pol_id, p1.name AS chair_name, p1.party AS chair_party, p1.district AS chair_district,
-              p2.name AS vice_chair_name
-       FROM committees c
-       LEFT JOIN politicians p1 ON p1.id = c.chair_id
-       LEFT JOIN politicians p2 ON p2.id = c.vice_chair_id
-       ${chamber ? 'WHERE LOWER(c.chamber) = LOWER(?)' : ''}
-       ORDER BY c.chamber ASC, c.name ASC`
-    )
-    .all(...(chamber ? [chamber] : [])) as Array<{
-    id: string;
-    name: string;
-    chamber: Chamber;
-    session: string;
-    jurisdiction: string;
-    chair_pol_id: string | null;
-    chair_name: string | null;
-    chair_party: string | null;
-    chair_district: string | null;
-    vice_chair_name: string | null;
-  }>;
-
-  const filtered = q
-    ? rows.filter((r) => {
-        const hay = `${r.name} ${r.jurisdiction}`.toLowerCase();
-        if (hay.includes(q)) return true;
-        if (expansion && expansion.committeeTerms.some((t) => hay.includes(t))) return true;
-        return q
-          .split(/\s+/)
-          .filter((w) => w.length >= 3)
-          .some((w) => hay.includes(w));
-      })
-    : rows;
-
-  const finalList = (filtered.length > 0 ? filtered : rows).slice(0, 15);
-  for (const r of finalList) {
-    if (r.chair_pol_id && r.chair_name) {
-      registerPoliticianCitation(ctx, {
-        id: r.chair_pol_id,
-        name: r.chair_name,
-        shortName: r.chair_name,
-        chamber: r.chamber,
-        party: r.chair_party || '—',
-        district: r.chair_district || '',
-        leadershipRole: `Chair, ${r.chamber} ${r.name}`,
-        reason: `Committee Chair (${r.jurisdiction || r.name})`,
-      });
-    }
-  }
-
-  return {
-    payload: {
-      query: q || '(all committees)',
-      matchedSpecifically: filtered.length > 0,
-      committees: finalList.map((r) => ({
-        name: `${r.chamber} ${r.name}`,
-        session: r.session,
-        chair: r.chair_name || 'Unassigned',
-        viceChair: r.vice_chair_name || 'Unassigned',
-        jurisdiction: r.jurisdiction,
-      })),
-    },
-    summary: `${finalList.length} committee${finalList.length === 1 ? '' : 's'} returned`,
-    resultCount: finalList.length,
-  };
-}
-
 function toolSearchStatutes(
   args: { query: string; code?: string; limit?: number },
   _ctx: AgentExecutionContext
@@ -1229,7 +1574,7 @@ function toolSearchStatutes(
   const q = safeStr(args.query).trim();
   const code = safeStr(args.code).trim().toUpperCase();
   const limit = Math.min(12, Math.max(1, Number(args.limit) || 6));
-  const fts = buildFtsFromNaturalText(q);
+  const fts = buildFtsFromNaturalText(q, false);
 
   let rows: Array<{
     id: string;
@@ -1270,13 +1615,14 @@ const OPENAI_TOOLS = [
     function: {
       name: 'get_archive_overview',
       description:
-        'Get counts of all indexed Texas bills by session (including Passed/Failed/Vetoed totals), plus total legislators, committees, and statute sections in the local database.',
+        'Get exact counts of indexed Texas bills broken down by session (including Passed, Failed, Died in Committee, Vetoed, and Active totals), plus legislator, committee, and statute totals.',
       parameters: {
         type: 'object',
         properties: {
           session: {
             type: 'string',
-            description: 'Optional session code such as 90R, 89R, 891, 88R, 87R.',
+            description:
+              'ONLY set this if the user explicitly specified a session code (e.g. 90R, 89R, 88R) or an Active Session Filter header is present. OMIT to cover all sessions.',
           },
         },
       },
@@ -1287,23 +1633,71 @@ const OPENAI_TOOLS = [
     function: {
       name: 'search_and_count_bills',
       description:
-        'Search and count bills in the local Texas Capitol SQLite/FTS5 archive by policy topic, keywords, session, chamber, outcome (Passed/Failed/Vetoed/Active), or author. Returns exact totals by session/chamber/outcome plus top matching bills.',
+        'Search, filter, sort, and count bills in the local Texas Capitol SQLite/FTS5 archive (searching title, summary, subjects, and statute_codes — NOT full_text). Supports filtering by topic, session, chamber, outcome, disposition (e.g. "died in committee"), stage, author, minInfluenceScore, minBipartisanIndex, and sorting by influence, bipartisan, or influence_and_bipartisan. Returns exact counts in-scope plus bipartisanIndex and influenceScore on every bill.',
       parameters: {
         type: 'object',
         properties: {
           query: {
             type: 'string',
-            description: 'Keywords or policy topic (e.g., "autonomous driving", "medicaid", "school finance", "ERCOT"). Leave empty to count all bills matching filters.',
+            description:
+              'Topic keywords (e.g., "autonomous driving", "medicaid", "school finance"). Leave empty when filtering strictly by metrics/outcomes like bipartisan index, influence score, or died in committee.',
           },
-          session: { type: 'string', description: 'Optional session filter (e.g., 89R, 90R, 88R).' },
-          chamber: { type: 'string', enum: ['House', 'Senate'], description: 'Optional chamber filter.' },
-          outcome: {
+          session: {
             type: 'string',
-            enum: ['Passed', 'Failed', 'Vetoed', 'Active'],
-            description: 'Optional outcome filter for previous vs active sessions.',
+            description:
+              'ONLY set if the user explicitly named a session (e.g. 90R, 89R, 88R). NEVER guess or default to 89R; omit to search all sessions.',
+          },
+          chamber: { type: 'string', enum: ['House', 'Senate'] },
+          outcome: { type: 'string', enum: ['Passed', 'Failed', 'Vetoed', 'Active'] },
+          disposition: {
+            type: 'string',
+            description:
+              'Optional failure/passage disposition substring (e.g., "died in committee", "conference impasse", "died on calendar", "died in opposite chamber", "line-item veto").',
+          },
+          stage: {
+            type: 'string',
+            description: 'Optional legislative stage (Pre-Filed, Filed, Committee Hearing, Committee Reported, Engrossed, Enrolled, Signed, Vetoed, Stalled).',
           },
           author: { type: 'string', description: 'Optional author surname or name.' },
-          limit: { type: 'number', description: 'Max bills to return in sample (default 12).' },
+          minInfluenceScore: {
+            type: 'number',
+            description: 'Optional minimum influence score (0-100) when the user asks for high-influence bills.',
+          },
+          minBipartisanIndex: {
+            type: 'number',
+            description: 'Optional minimum bipartisan index (0.0-1.0) when the user asks for high-bipartisan bills.',
+          },
+          sortBy: {
+            type: 'string',
+            enum: ['influence', 'bipartisan', 'influence_and_bipartisan', 'amendments', 'recent'],
+            description: 'Sort order. Use "influence_and_bipartisan" when the user asks for BOTH high influence and high bipartisan index.',
+          },
+          limit: { type: 'number', description: 'Max bills to return in sample (default 12, max 25).' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_committee_stats',
+      description:
+        'Compute real committee bottleneck, referral, reporting, and passage rate statistics directly from the bills table (committees_json) and committee chairs. Use this for any question about committee passage rates, bottlenecks, referrals, or chairs.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Optional committee name or policy area filter.' },
+          chamber: { type: 'string', enum: ['House', 'Senate'] },
+          session: {
+            type: 'string',
+            description: 'ONLY set if the user explicitly named a session. Omit to compute across all sessions.',
+          },
+          sortBy: {
+            type: 'string',
+            enum: ['bottleneck', 'most_referred', 'highest_passage'],
+            description: 'Use "bottleneck" for lowest passage/report rates, "most_referred" for highest volume, "highest_passage" for highest passage rates.',
+          },
+          limit: { type: 'number', description: 'Max committees to return (default 12).' },
         },
       },
     },
@@ -1313,20 +1707,20 @@ const OPENAI_TOOLS = [
     function: {
       name: 'rank_policy_influence',
       description:
-        'Rank Texas legislators by influence over a specific policy area (e.g., medicaid, education, ERCOT grid, property tax, autonomous driving) combining committee chair/gatekeeping power, authored & passed bills, leadership roles, roll-call votes, and related-sector PAC filings.',
+        'Rank Texas legislators by influence over a specific policy area combining committee chair/gatekeeping power, authored & passed bills, leadership roles, roll-call votes, and related-sector PAC filings.',
       parameters: {
         type: 'object',
         properties: {
-          topic: {
-            type: 'string',
-            description: 'Policy area to evaluate (e.g., "medicaid", "public education", "autonomous driving", "ERCOT energy").',
-          },
+          topic: { type: 'string', description: 'Policy area to evaluate (e.g., "medicaid", "public education", "ERCOT energy").' },
           chamber: {
             type: 'string',
             enum: ['House', 'Senate'],
             description: 'Use "House" when asked about representatives, "Senate" when asked about senators, or omit for both.',
           },
-          session: { type: 'string', description: 'Optional session scope.' },
+          session: {
+            type: 'string',
+            description: 'ONLY set if the user explicitly named a session. Omit to evaluate across all sessions.',
+          },
           limit: { type: 'number', description: 'Max ranked legislators to return (default 8).' },
         },
         required: ['topic'],
@@ -1356,23 +1750,9 @@ const OPENAI_TOOLS = [
         type: 'object',
         properties: {
           billRef: { type: 'string', description: 'Bill number or ID like "HB 2" or "89R-HB4".' },
-          session: { type: 'string', description: 'Optional session code like "89R".' },
+          session: { type: 'string', description: 'Optional session code ONLY if explicitly requested.' },
         },
         required: ['billRef'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'search_committees',
-      description: 'Search Texas House and Senate committees by policy topic, jurisdiction, or chamber, returning chairs and jurisdictions.',
-      parameters: {
-        type: 'object',
-        properties: {
-          query: { type: 'string', description: 'Policy topic or committee name.' },
-          chamber: { type: 'string', enum: ['House', 'Senate'] },
-        },
       },
     },
   },
@@ -1408,6 +1788,10 @@ function executeTool(
     case 'search_and_count_bills':
       res = toolSearchAndCountBills(args as Parameters<typeof toolSearchAndCountBills>[0], ctx);
       break;
+    case 'get_committee_stats':
+    case 'search_committees':
+      res = toolGetCommitteeStats(args as Parameters<typeof toolGetCommitteeStats>[0], ctx);
+      break;
     case 'rank_policy_influence':
       res = toolRankPolicyInfluence(args as Parameters<typeof toolRankPolicyInfluence>[0], ctx);
       break;
@@ -1416,9 +1800,6 @@ function executeTool(
       break;
     case 'get_bill_details':
       res = toolGetBillDetails(args as { billRef: string; session?: string }, ctx);
-      break;
-    case 'search_committees':
-      res = toolSearchCommittees(args as { query?: string; chamber?: string }, ctx);
       break;
     case 'search_statutes':
       res = toolSearchStatutes(args as { query: string; code?: string; limit?: number }, ctx);
@@ -1444,36 +1825,18 @@ function executeTool(
 }
 
 // ============================================================================
-// DETERMINISTIC QUERY PLANNER (used when LLM lacks tool-calling or is offline)
+// DETERMINISTIC QUERY PLANNER & GUARDRAILS
 // ============================================================================
 
-function extractTopicFromQuestion(question: string): string {
-  const q = question.trim();
-  const patterns = [
-    /\bhow many\s+([a-z0-9\s-]+?)\s+bills?\b/i,
-    /\binfluence\s+(?:over|on)\s+([^?.!]+)/i,
-    /\bbills?\s+(?:introduced|filed|passed|failed)\s+(?:about|on|for|regarding|involving)\s+([^?.!]+)/i,
-    /\b(?:about|regarding|over|related to|involving)\s+([^?.!]+)/i,
-    /\bwhat\s+([a-z0-9\s-]+?)\s+bills?\b/i,
-  ];
-  for (const re of patterns) {
-    const m = q.match(re);
-    if (m && m[1]) {
-      const candidate = m[1]
-        .replace(/\b(in\s+\d{2}[r1-4]|across\s+[\w\s,-]+|in\s+texas|policy|legislation|bills?|session|previous sessions?|passed|failed|vs\.?)\b/gi, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-      if (candidate.length >= 2) return candidate;
-    }
-  }
-  return q
-    .replace(
-      /\b(how|many|which|who|what|are|is|have|has|been|were|was|the|greatest|most|top|bills?|introduced|filed|passed|failed|vs|representatives?|senators?|legislators?|lawmakers?|influence|over|on|about|policy|texas|session|sessions|across|in|and|\d{2}[r1-4])\b/gi,
-      ' '
-    )
-    .replace(/[?!.,]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+function detectSessionFromQuestion(question: string, sessionScope: string): string | undefined {
+  // Match explicit session codes like 89R, 90R, 891, 89-1, 88-2
+  const codeMatch = question.match(/\b(\d{2}(?:[Rr]|[-_]?[1-4]))\b/);
+  if (codeMatch) return normalizeSessionCode(codeMatch[1]);
+  // Match ordinal legislature mentions like "89th legislature", "90th session"
+  const ordMatch = question.match(/\b(\d{2})(?:st|nd|rd|th)\s+(?:texas\s+)?(?:legislature|session)\b/i);
+  if (ordMatch) return `${ordMatch[1]}R`;
+  if (sessionScope) return normalizeSessionCode(sessionScope);
+  return undefined;
 }
 
 function detectChamberFromQuestion(question: string): 'House' | 'Senate' | undefined {
@@ -1485,11 +1848,66 @@ function detectChamberFromQuestion(question: string): 'House' | 'Senate' | undef
   return undefined;
 }
 
-function detectSessionFromQuestion(question: string, sessionScope: string): string | undefined {
-  const m = question.match(/\b(\d{2}[Rr]|\d{2}[1-4])\b/);
-  if (m) return m[1].toUpperCase();
-  if (sessionScope) return sessionScope.toUpperCase();
+function detectDispositionFromQuestion(question: string): string | undefined {
+  const lower = question.toLowerCase();
+  if (/\bdied in committee\b|\bstuck in committee\b|\bleft pending in committee\b/.test(lower)) {
+    return 'died in committee';
+  }
+  if (/\bconference\b.*\bimpasse\b|\bconference committee\b.*\bfailed\b/.test(lower)) {
+    return 'conference impasse';
+  }
+  if (/\bdied on (?:the )?(?:calendar|floor)\b/.test(lower)) {
+    return 'died on calendar';
+  }
+  if (/\bdied in (?:the )?opposite chamber\b/.test(lower)) {
+    return 'died in opposite chamber';
+  }
+  if (/\bdied in filing\b/.test(lower)) {
+    return 'died in filing';
+  }
   return undefined;
+}
+
+function extractTopicFromQuestion(question: string): string {
+  const q = question.trim();
+  // Pure metric / disposition / committee-stats questions should NOT turn metric words into a keyword query
+  const lower = q.toLowerCase();
+  if (
+    /\bbipartisan\b/.test(lower) &&
+    !/\b(about|regarding|on|for)\s+(?!bipartisan|influence|high)/i.test(lower)
+  ) {
+    return '';
+  }
+
+  const patterns = [
+    /\bhow many\s+([a-z0-9\s-]+?)\s+bills?\b/i,
+    /\binfluence\s+(?:over|on)\s+([^?.!]+)/i,
+    /\bbills?\s+(?:introduced|filed|passed|failed)\s+(?:about|on|for|regarding|involving)\s+([^?.!]+)/i,
+    /\b(?:about|regarding|over|related to|involving)\s+([^?.!]+)/i,
+    /\bwhat\s+([a-z0-9\s-]+?)\s+bills?\b/i,
+  ];
+  for (const re of patterns) {
+    const m = q.match(re);
+    if (m && m[1]) {
+      const candidate = m[1]
+        .replace(
+          /\b(in\s+\d{2}(?:[r1-4]|-\d)|across\s+[\w\s,-]+|in\s+texas|policy|legislation|bills?|session|sessions|previous sessions?|passed|failed|died|committee|committees|bottleneck|bottlenecks|passage\s+rates?|vs\.?|high|both|influence|score|scores|bipartisan|index)\b/gi,
+          ' '
+        )
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (candidate.length >= 2) return candidate;
+    }
+  }
+  const stripped = q
+    .replace(
+      /\b(how|many|which|who|what|are|is|have|has|been|were|was|the|greatest|most|lowest|highest|biggest|top|both|high|low|bills?|introduced|filed|passed|failed|died|stalled|vetoed|vs|representatives?|senators?|legislators?|lawmakers?|committee|committees|bottleneck|bottlenecks|passage|rate|rates|influence|score|scores|bipartisan|index|over|on|about|policy|texas|session|sessions|across|in|and|with|by|\d{2}(?:[r1-4]|-\d)|\d{2}(?:st|nd|rd|th))\b/gi,
+      ' '
+    )
+    .replace(/[?!.,]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return stripped.length >= 2 ? stripped : '';
 }
 
 function runDeterministicPlan(
@@ -1500,17 +1918,27 @@ function runDeterministicPlan(
   const lower = question.toLowerCase();
   const chamber = detectChamberFromQuestion(question);
   const session = detectSessionFromQuestion(question, sessionScope);
+  const disposition = detectDispositionFromQuestion(question);
   const topic = extractTopicFromQuestion(question);
 
   const evidence: Record<string, unknown> = {};
   const overview = executeTool('get_archive_overview', session ? { session } : {}, ctx);
   evidence.archiveOverview = overview;
 
-  const isInfluenceQuery =
-    /\b(influence|influential|control|powerful|key|top|which\s+(representative|representatives|senator|senators|legislator|legislators|member|members)|who\s+controls?|who\s+leads?)\b/i.test(
+  const isBipartisanQuery = /\bbipartisan\b/i.test(lower);
+  const isHighInfluenceBillQuery =
+    /\bbills?\b/i.test(lower) && /\binfluence\b/i.test(lower) && !/\b(representative|senator|legislator|who)\b/i.test(lower);
+  const isInfluencePersonQuery =
+    !isHighInfluenceBillQuery &&
+    /\b(influence|influential|control|powerful|which\s+(representative|representatives|senator|senators|legislator|legislators|member|members)|who\s+controls?|who\s+leads?)\b/i.test(
       lower
     );
-  const isCommitteeQuery = /\bcommittee|committees|chair|chairs\b/i.test(lower);
+  const isCommitteeStatsQuery =
+    !disposition &&
+    /\b(committee|committees)\b/i.test(lower) &&
+    /\b(bottleneck|bottlenecks|passage\s+rate|pass\s+rate|report\s+rate|referral|referred|lowest|highest|most|chair|chairs|stats|statistics)\b/i.test(
+      lower
+    );
   const isStatuteQuery = /\bstatute|statutes|code section|penal code|education code|tax code\b/i.test(lower);
   const specificBillMatch = question.match(/\b(HB|SB|HJR|SJR|HCR|SCR)\s*(\d+)\b/i);
 
@@ -1527,14 +1955,54 @@ function runDeterministicPlan(
       const b = billRes.bill as Record<string, unknown>;
       lines.push(`### ${b.session} ${b.billNumber} — ${b.title}`);
       lines.push(
-        `- **Outcome / Stage:** ${b.outcomeDetail} (Stage: ${b.stage}) · **Primary Author:** ${b.primaryAuthor} · **Influence Score:** ${b.influenceScore}`
+        `- **Outcome / Stage:** ${b.outcomeDetail} · **Primary Author:** ${b.primaryAuthor} · **Influence:** ${b.influenceScore} · **Bipartisan Index:** ${b.bipartisanIndex}`
       );
       if (b.summary) lines.push(`- **Summary:** ${b.summary}`);
       if (b.lastAction) lines.push(`- **Last Action (${b.lastActionDate}):** ${b.lastAction}`);
     }
   }
 
-  if (isInfluenceQuery) {
+  if (isCommitteeStatsQuery) {
+    const sortBy = /\b(highest|best|top)\b/i.test(lower)
+      ? 'highest_passage'
+      : /\b(most\s+referred|busiest|volume)\b/i.test(lower)
+        ? 'most_referred'
+        : 'bottleneck';
+
+    const commRes = executeTool(
+      'get_committee_stats',
+      {
+        ...(topic ? { query: topic } : {}),
+        ...(chamber ? { chamber } : {}),
+        ...(session ? { session } : {}),
+        sortBy,
+        limit: 12,
+      },
+      ctx
+    );
+    evidence.committeeStats = commRes;
+
+    const comms = (commRes.committees as Array<Record<string, unknown>>) || [];
+    lines.push(
+      `### Committee Referral & Passage Statistics (${session || 'All Sessions'})`
+    );
+    lines.push(
+      `Computed directly from **${commRes.totalBillsEvaluatedInScope}** indexed bills${session ? ` in ${session}` : ' across all sessions'}.`
+    );
+    for (const c of comms.slice(0, 10)) {
+      const activeSuffix =
+        Number(c.activeCount || 0) > 0 ? ` · ${c.activeCount} active` : '';
+      const passRateLabel =
+        c.passageRatePct !== null && c.passageRatePct !== undefined
+          ? `${c.passageRatePct}%${Number(c.activeCount || 0) > 0 ? ' of concluded' : ''}`
+          : 'N/A';
+      lines.push(
+        `- **${c.committee}** (Chair: ${c.chair}) — **${c.referredCount}** referred · **${c.reportedCount}** reported (${c.reportRatePct}%) · **${c.passedCount}** passed (${passRateLabel}) · ${c.diedInCommitteeCount} died in committee${activeSuffix}`
+      );
+    }
+  }
+
+  if (isInfluencePersonQuery) {
     const rankRes = executeTool(
       'rank_policy_influence',
       {
@@ -1552,10 +2020,10 @@ function runDeterministicPlan(
     const topicBillCount = Number(rankRes.matchingTopicBillsCount || 0);
 
     lines.push(
-      `### Highest-Influence ${chamber === 'House' ? 'Texas House Representatives' : chamber === 'Senate' ? 'Texas Senators' : 'Texas Legislators'} on "${topic || question}"`
+      `### Highest-Influence ${chamber === 'House' ? 'Texas House Representatives' : chamber === 'Senate' ? 'Texas Senators' : 'Texas Legislators'} on "${topic || question}" (${session || 'All Sessions'})`
     );
     lines.push(
-      `Evaluated **${topicBillCount}** matching bill${topicBillCount === 1 ? '' : 's'} and **${relComms.length}** relevant committee${relComms.length === 1 ? '' : 's'} across the indexed SQLite archive (${(overview.totalBillsIndexed as number) ?? 0} total bills, ${(overview.politiciansIndexed as number) ?? 0} legislators).`
+      `Evaluated **${topicBillCount}** matching bill${topicBillCount === 1 ? '' : 's'} and **${relComms.length}** relevant committee${relComms.length === 1 ? '' : 's'} (${(overview.totalBillsInScope as number) ?? 0} bills in scope, ${(overview.politiciansIndexed as number) ?? 0} legislators).`
     );
 
     if (ranked.length > 0) {
@@ -1571,26 +2039,33 @@ function runDeterministicPlan(
     }
 
     if (relComms.length > 0) {
-      lines.push(
-        `\n**Key Gatekeeping Committees:** ${relComms.map((c) => c.name).join(', ')}.`
-      );
-    }
-    if (topicBillCount === 0) {
-      lines.push(
-        `\n*Archive note:* 0 bills specifically mentioning "${topic}" are synced locally yet. Use **Sync TLO FTP** to import full session archives (e.g., 89R or 88R) to deepen bill-level scoring.`
-      );
+      lines.push(`\n**Key Gatekeeping Committees:** ${relComms.map((c) => c.name).join(', ')}.`);
     }
   }
 
-  if (!isInfluenceQuery || /\bhow many|count|bills?\b/i.test(lower)) {
-    const outcomeParam =
-      /\bpassed|enacted|signed\b/i.test(lower) && !/\bfailed|vs\.?\s*failed\b/i.test(lower)
+  if (
+    (!isInfluencePersonQuery && !isCommitteeStatsQuery) ||
+    isBipartisanQuery ||
+    isHighInfluenceBillQuery ||
+    Boolean(disposition) ||
+    /\bhow many|count\b/i.test(lower)
+  ) {
+    const outcomeParam = disposition
+      ? 'Failed'
+      : /\bpassed|enacted|signed\b/i.test(lower) && !/\bfailed|vs\.?\s*failed\b/i.test(lower)
         ? 'Passed'
         : /\bfailed|died|stalled\b/i.test(lower) && !/\bpassed\b/i.test(lower)
           ? 'Failed'
           : /\bvetoed\b/i.test(lower)
             ? 'Vetoed'
             : undefined;
+
+    const sortBy: 'influence' | 'bipartisan' | 'influence_and_bipartisan' =
+      isBipartisanQuery && /\binfluence\b/i.test(lower)
+        ? 'influence_and_bipartisan'
+        : isBipartisanQuery
+          ? 'bipartisan'
+          : 'influence';
 
     const billSearch = executeTool(
       'search_and_count_bills',
@@ -1599,23 +2074,39 @@ function runDeterministicPlan(
         ...(session ? { session } : {}),
         ...(chamber ? { chamber } : {}),
         ...(outcomeParam ? { outcome: outcomeParam } : {}),
+        ...(disposition ? { disposition } : {}),
+        ...(isBipartisanQuery ? { minBipartisanIndex: 0.3 } : {}),
+        ...(isBipartisanQuery && /\binfluence\b/i.test(lower) ? { minInfluenceScore: 40 } : {}),
+        sortBy,
         limit: 12,
       },
       ctx
     );
     evidence.billSearch = billSearch;
 
-    if (!isInfluenceQuery) {
+    if (!isInfluencePersonQuery && !isCommitteeStatsQuery) {
       const total = Number(billSearch.totalMatches || 0);
-      const totalArchive = Number(billSearch.totalIndexedBillsInArchive || 0);
+      const totalInScope = Number(billSearch.totalBillsInScope || 0);
       const bySession = (billSearch.bySession as Array<Record<string, unknown>>) || [];
       const byOutcome = (billSearch.byOutcome as Record<string, number>) || {};
       const bills = (billSearch.bills as Array<Record<string, unknown>>) || [];
 
-      lines.push(`### Bill Count & Archive Findings: "${topic || 'All Bills'}"`);
+      const headingSubject =
+        disposition
+          ? `Disposition: "${disposition}"`
+          : isBipartisanQuery
+            ? 'High Influence & High Bipartisan Index Bills'
+            : topic
+              ? `"${topic}"`
+              : 'Matching Legislation';
+
+      lines.push(`### ${headingSubject} (${session || 'All Sessions'})`);
       lines.push(
-        `- **Total Matching Bills in Local Archive:** **${total}** (out of **${totalArchive}** indexed bills${session ? ` in ${session}` : ''}).`
+        `- **Matching Bills:** **${total}** out of **${totalInScope}** indexed bills ${session ? `in ${session}` : 'across all sessions'}.`
       );
+      if (billSearch.sessionNote) {
+        lines.push(`- *Note:* ${billSearch.sessionNote}`);
+      }
 
       if (total > 0) {
         lines.push(
@@ -1627,35 +2118,22 @@ function runDeterministicPlan(
           );
         }
         lines.push('\n**Matching Bills:**');
-        for (const b of bills.slice(0, 8)) {
+        for (const b of bills.slice(0, 10)) {
           lines.push(
-            `- **${b.session} ${b.billNumber}** (${b.outcomeDetail}) — ${b.title} *(Author: ${b.primaryAuthor})*`
+            `- **${b.session} ${b.billNumber}** (${b.outcomeDetail} · Influence **${b.influenceScore}** · Bipartisan **${b.bipartisanIndex}**) — ${b.title} *(Author: ${b.primaryAuthor})*`
           );
         }
       } else {
         const syncedSessions = ((overview.sessions as Array<{ session: string; total: number }>) || [])
           .map((s) => `${s.session} (${s.total})`)
           .join(', ');
-        lines.push(
-          `- Currently indexed sessions: ${syncedSessions || 'None'}.`
-        );
-        lines.push(
-          `- To search the full Texas Legislature history for **"${topic}"**, open **Sync TLO FTP** on the Legislation tab and sync the full 89R, 88R, or 87R session archives into SQLite.`
-        );
+        lines.push(`- Indexed sessions in scope: ${syncedSessions || 'None'}.`);
       }
     }
   }
 
-  if (isCommitteeQuery) {
-    evidence.committees = executeTool(
-      'search_committees',
-      { query: topic, ...(chamber ? { chamber } : {}) },
-      ctx
-    );
-  }
-
   if (isStatuteQuery) {
-    evidence.statutes = executeTool('search_statutes', { query: topic }, ctx);
+    evidence.statutes = executeTool('search_statutes', { query: topic || question }, ctx);
   }
 
   return {
@@ -1664,7 +2142,6 @@ function runDeterministicPlan(
   };
 }
 
-// Parse fallback <tool_call> JSON if a local Qwen model emits text-formatted tool calls
 function parseInlineToolCalls(content: string): Array<{ name: string; arguments: Record<string, unknown> }> {
   const results: Array<{ name: string; arguments: Record<string, unknown> }> = [];
   const regex = /<tool_call>\s*(\{[\s\S]*?\})\s*<\/tool_call>/gi;
@@ -1695,16 +2172,24 @@ interface ChatMessage {
 }
 
 const SYSTEM_PROMPT = `You are the Texas Capitol Ledger Research Agent — an objective, data-driven Texas legislative analyst.
-You have read-only tools connected directly to the user's live SQLite + FTS5 Texas Legislature archive (bills, outcomes, committees, legislators, roll-call votes, TEC campaign finance donors, and Texas statutes).
+You have read-only tools connected directly to the user's live SQLite + FTS5 Texas Legislature archive.
 
-CRITICAL RULES:
-1. ALWAYS call the appropriate tools before answering. NEVER invent bill counts, bill numbers, committee seats, or legislator names.
-2. For questions like "how many bills about X", call search_and_count_bills (and get_archive_overview if 0 matches so you can report what sessions are currently synced locally).
-3. For questions like "which representatives/senators have the greatest influence over X policy", call rank_policy_influence (set chamber="House" for representatives, "Senate" for senators) AND search_and_count_bills if helpful.
-4. Distinguish clearly between:
-   - What is verified in the currently indexed local database (exact counts, exact bills, exact committees/chairs/funding), and
-   - Whether additional sessions should be synced via TLO FTP if 0 or few bills match a niche topic.
-5. Present crisp, structured answers using concise markdown headings and bullet points with exact figures, bill numbers (e.g., 89R HB 2), and legislator names.`;
+STRICT ACCURACY & GROUNDING RULES:
+1. ALWAYS call the appropriate tools before answering. NEVER invent counts, percentages, bill numbers, committee stats, or legislator names.
+2. NEVER default to a specific session (like 89R) unless the user explicitly named a session OR an [Active Session Filter] header is present. When no session is specified, OMIT the session parameter so you search ALL indexed sessions, and report counts across all sessions (or broken down by session).
+3. RESPECT EVERY CRITERION in the user's question. If the user asks for multiple criteria (e.g., BOTH high influence score AND high bipartisan index), pass minInfluenceScore / minBipartisanIndex / sortBy="influence_and_bipartisan" and verify in the returned JSON that EVERY bill you cite actually meets ALL requested criteria. Do NOT silently drop a criterion or substitute passed/enacted status for bipartisan index.
+4. For committee passage rates, bottlenecks, or referrals, ALWAYS call get_committee_stats — never estimate or fabricate committee rates from keyword trends.
+5. For session-specific counts, ALWAYS cite totalBillsInScope for that session (NEVER confuse totalBillsAllSessions with a single session's count!).
+6. Note that 90R is the upcoming/active 90th Legislature; bills in 90R are "Active" and have not died at sine die.
+7. Present crisp, structured answers using concise markdown headings and bullet points with exact numbers, bill numbers, influence/bipartisan metrics when relevant, and legislator names.`;
+
+const SYNTHESIS_SYSTEM_PROMPT = `You are a Texas legislative research analyst. You are given verified JSON evidence from direct SQLite database queries.
+
+STRICT RULES:
+1. Answer ONLY using the provided JSON evidence. Do NOT fabricate numbers, passage rates, bill numbers, or legislator names.
+2. Verify ALL criteria requested by the user (for example, if the user asked for bills with BOTH high influence score AND high bipartisan index, explicitly cite both influenceScore and bipartisanIndex for each bill and ONLY include bills that meet BOTH criteria — never substitute one criterion for another).
+3. Respect the exact session scope in the JSON: if scope is "ALL SESSIONS", state findings across all sessions (broken down by session when available) and NEVER claim the results are only from 89R. If a specific session was queried, cite totalBillsInScope for that session (NOT totalBillsAllSessions).
+4. Present concise, factual markdown with exact figures, bill numbers, and legislator names.`;
 
 export async function runResearchAgent(input: {
   question: string;
@@ -1712,7 +2197,8 @@ export async function runResearchAgent(input: {
   priorTurns?: Array<{ question: string; answer: string }>;
 }): Promise<ResearchQueryRecord> {
   const question = input.question.trim();
-  const sessionScope = (input.sessionScope || '').trim();
+  const sessionScope = normalizeSessionCode(input.sessionScope || '');
+  const explicitUserSession = detectSessionFromQuestion(question, sessionScope);
   const cfg = getLocalLlmConfig();
   const ctx: AgentExecutionContext = {
     citedBillsMap: new Map(),
@@ -1720,10 +2206,24 @@ export async function runResearchAgent(input: {
     traces: [],
   };
 
+  // Code-level guardrail: prevent 7B models from hallucinating session="89R" when neither the user nor UI filter requested a session
+  const sanitizeToolArgs = (name: string, rawArgs: Record<string, unknown>): Record<string, unknown> => {
+    const args = { ...rawArgs };
+    if (
+      ['get_archive_overview', 'search_and_count_bills', 'get_committee_stats', 'rank_policy_influence'].includes(name)
+    ) {
+      if (!explicitUserSession && args.session) {
+        delete args.session;
+      } else if (explicitUserSession && !args.session) {
+        args.session = explicitUserSession;
+      }
+    }
+    return args;
+  };
+
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`;
 
-  // Fast reachability check (3s) so offline/LAN-isolated servers immediately fall back to deterministic SQLite evidence
   const probe = await checkLocalLlmReachable(3000);
 
   let answer = '';
@@ -1741,7 +2241,7 @@ export async function runResearchAgent(input: {
         role: 'user',
         content: sessionScope
           ? `[Active Session Filter: ${sessionScope}]\n${question}`
-          : question,
+          : `[Scope: All Indexed Sessions — do NOT filter to a single session unless the user explicitly names one]\n${question}`,
       });
 
       let toolCallingUnsupported = false;
@@ -1753,9 +2253,9 @@ export async function runResearchAgent(input: {
           signal: AbortSignal.timeout(75000),
           body: JSON.stringify({
             model: cfg.model,
-            temperature: 0.15,
+            temperature: 0.1,
             tools: OPENAI_TOOLS,
-            tool_choice: step === 0 ? 'auto' : 'auto',
+            tool_choice: 'auto',
             messages,
           }),
         });
@@ -1820,7 +2320,8 @@ export async function runResearchAgent(input: {
             } else if (tc.function?.arguments && typeof tc.function.arguments === 'object') {
               parsedArgs = tc.function.arguments;
             }
-            const toolOutput = executeTool(fnName, parsedArgs, ctx);
+            const safeArgs = sanitizeToolArgs(fnName, parsedArgs);
+            const toolOutput = executeTool(fnName, safeArgs, ctx);
             messages.push({
               role: 'tool',
               tool_call_id: tc.id || `call_${step}_${i}`,
@@ -1835,19 +2336,18 @@ export async function runResearchAgent(input: {
           messages.push({ role: 'assistant', content: msg.content || '' });
           const inlineOutputs: string[] = [];
           for (const ic of inlineCalls) {
-            const toolOutput = executeTool(ic.name, ic.arguments, ctx);
+            const safeArgs = sanitizeToolArgs(ic.name, ic.arguments);
+            const toolOutput = executeTool(ic.name, safeArgs, ctx);
             inlineOutputs.push(`Tool ${ic.name} result:\n${JSON.stringify(toolOutput)}`);
           }
           messages.push({
             role: 'user',
-            content: `Here are the tool results from the local SQLite database. Now write your final grounded answer:\n\n${inlineOutputs.join('\n\n')}`,
+            content: `Here are the verified tool results from SQLite. Write your final grounded answer verifying ALL user criteria:\n\n${inlineOutputs.join('\n\n')}`,
           });
           continue;
         }
 
-        // Model produced final text directly
         if (ctx.traces.length === 0 && step === 0) {
-          // Enforce grounding: if the 7B model skipped calling tools on step 0, run our deterministic planner and have it synthesize!
           toolCallingUnsupported = true;
           break;
         }
@@ -1857,7 +2357,6 @@ export async function runResearchAgent(input: {
         break;
       }
 
-      // Layer 2 fallback: deterministic SQLite retrieval + single-shot LLM synthesis
       if (toolCallingUnsupported || !answer) {
         const plan = runDeterministicPlan(question, sessionScope, ctx);
         const synthRes = await fetch(cfg.endpoint, {
@@ -1866,16 +2365,12 @@ export async function runResearchAgent(input: {
           signal: AbortSignal.timeout(75000),
           body: JSON.stringify({
             model: cfg.model,
-            temperature: 0.15,
+            temperature: 0.1,
             messages: [
-              {
-                role: 'system',
-                content:
-                  'You are a Texas legislative research analyst. Answer the user question concisely using ONLY the structured SQLite database evidence provided below. Cite exact numbers, bill numbers, committees, and legislator names.',
-              },
+              { role: 'system', content: SYNTHESIS_SYSTEM_PROMPT },
               {
                 role: 'user',
-                content: `Question: ${question}\n\nDatabase Evidence (JSON):\n${JSON.stringify(plan.evidence, null, 2)}`,
+                content: `Question: ${question}\nSession Scope: ${explicitUserSession || 'ALL SESSIONS'}\n\nDatabase Evidence (JSON):\n${JSON.stringify(plan.evidence, null, 2)}`,
               },
             ],
           }),
@@ -1903,7 +2398,6 @@ export async function runResearchAgent(input: {
       warning = `Local LLM (${cfg.model} at ${cfg.baseUrl}) encountered an error (${err instanceof Error ? err.message : 'unreachable'}); displaying direct SQLite/FTS5 evidence.`;
     }
   } else {
-    // Layer 3: Local LLM is offline or outside current network — execute deterministic SQLite research plan directly
     const plan = runDeterministicPlan(question, sessionScope, ctx);
     answer = plan.fallbackMarkdown;
     mode = 'deterministic_fallback';
