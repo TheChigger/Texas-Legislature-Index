@@ -194,7 +194,7 @@ const POLICY_EXPANSIONS: PolicyExpansion[] = [
   },
   {
     triggers: ['education', 'school', 'voucher', 'staar', 'teacher', 'allotment', 'isd', 'esa'],
-    billTerms: ['education', 'school', 'allotment', 'teacher', 'voucher', 'freedom accounts', 'staar', 'assessment', 'prekindergarten'],
+    billTerms: ['education', 'school', 'allotment', 'teacher', 'voucher', 'freedom accounts', 'staar', 'student assessment', 'prekindergarten'],
     committeeTerms: ['public education', 'education', 'appropriations', 'finance'],
     donorSectors: ['education', 'teacher', 'school', 'charter', 'civic'],
     fiscalRelevant: true,
@@ -365,9 +365,10 @@ function buildFtsFromNaturalText(raw: string, metadataColumnsOnly = true): strin
         ? `"${tokens[0]}"`
         : `"${tokens[0]}"*`
       : tokens.map((t) => (t.length < 5 ? `"${t}"` : `"${t}"*`)).join(' AND ');
-  // Restrict bills_fts matches to metadata columns (title, summary, subjects, statute_codes)
-  // so incidental words buried inside long full_text excerpts do not cause cross-topic leakage.
-  return metadataColumnsOnly ? `{title summary subjects statute_codes} : (${expr})` : expr;
+  // Restrict bills_fts matches to topic metadata columns (title, summary, subjects)
+  // excluding both full_text excerpts and statute_codes cross-references so bills
+  // that merely amend a single line of another code do not leak across topics.
+  return metadataColumnsOnly ? `{title summary subjects} : (${expr})` : expr;
 }
 
 function buildOrFtsFromTerms(terms: string[], metadataColumnsOnly = true): string {
@@ -378,7 +379,7 @@ function buildOrFtsFromTerms(terms: string[], metadataColumnsOnly = true): strin
   const unique = Array.from(new Set(parts));
   if (unique.length === 0) return '';
   const expr = unique.join(' OR ');
-  return metadataColumnsOnly ? `{title summary subjects statute_codes} : (${expr})` : expr;
+  return metadataColumnsOnly ? `{title summary subjects} : (${expr})` : expr;
 }
 
 interface BillDbRow {
@@ -572,13 +573,31 @@ function toolGetArchiveOverview(
   };
 }
 
+function getSubstantiveSummary(row: BillDbRow): string {
+  const s = safeStr(row.summary).trim();
+  // TLO FTP imports store boilerplate "TLO FTP Record (...) — <lastAction>. Primary author: ..."
+  // Ignore boilerplate summaries in topic matching so action/committee/author text never causes leakage.
+  if (!s || /^tlo\s+ftp\s+record\b/i.test(s)) return '';
+  return s;
+}
+
+function billCaptionContainsTokens(row: BillDbRow, tokens: string[]): boolean {
+  const hay = `${row.title} ${getSubstantiveSummary(row)}`;
+  return tokens.every((t) => matchesTermWithBoundary(hay, t));
+}
+
+function billCaptionContainsAnyPhrase(row: BillDbRow, phrases: string[]): boolean {
+  const hay = `${row.title} ${getSubstantiveSummary(row)}`;
+  return phrases.some((p) => matchesTermWithBoundary(hay, p));
+}
+
 function billMetadataContainsTokens(row: BillDbRow, tokens: string[]): boolean {
-  const hay = `${row.title} ${row.summary} ${row.subjects_json} ${row.statute_codes}`;
+  const hay = `${row.title} ${getSubstantiveSummary(row)} ${row.subjects_json}`;
   return tokens.every((t) => matchesTermWithBoundary(hay, t));
 }
 
 function billMetadataContainsAnyPhrase(row: BillDbRow, phrases: string[]): boolean {
-  const hay = `${row.title} ${row.summary} ${row.subjects_json} ${row.statute_codes}`;
+  const hay = `${row.title} ${getSubstantiveSummary(row)} ${row.subjects_json}`;
   return phrases.some((p) => matchesTermWithBoundary(hay, p));
 }
 
@@ -593,7 +612,11 @@ function queryBillsMatchingText(
     minBipartisanIndex?: number;
     includeFullText?: boolean;
   }
-): { rows: BillDbRow[]; matchMode: 'exact_metadata_fts' | 'expanded_metadata_fts' | 'all_filtered' } {
+): {
+  rows: BillDbRow[];
+  captionMatchIds: Set<string>;
+  matchMode: 'exact_metadata_fts' | 'expanded_metadata_fts' | 'all_filtered';
+} {
   const conditions: string[] = [];
   const params: Array<string | number> = [];
   if (filters.session) {
@@ -632,7 +655,7 @@ function queryBillsMatchingText(
     const rows = db
       .prepare(`SELECT b.* FROM bills b ${whereSql} ORDER BY b.influence_score DESC, b.last_action_date DESC`)
       .all(...params) as BillDbRow[];
-    return { rows, matchMode: 'all_filtered' };
+    return { rows, captionMatchIds: new Set<string>(), matchMode: 'all_filtered' };
   }
 
   const tokens = extractQueryTokens(trimmed);
@@ -641,7 +664,7 @@ function queryBillsMatchingText(
 
   // 1. If a curated domain expansion matches (e.g. "AI regulation" -> artificial intelligence + word-bounded AI,
   // or "autonomous driving" -> autonomous/automated vehicle phrases), run column-restricted FTS5 across
-  // the expansion terms AND verify with word-boundary regex against metadata columns ONLY.
+  // title/summary/subjects (excluding full_text and statute_codes) AND verify with word-boundary regex.
   if (exp) {
     const combinedTerms = Array.from(new Set([...exp.billTerms]));
     const ftsExpanded = buildOrFtsFromTerms(combinedTerms, metadataOnly);
@@ -660,17 +683,20 @@ function queryBillsMatchingText(
         const verified = metadataOnly
           ? rawRows.filter((r) => billMetadataContainsAnyPhrase(r, combinedTerms))
           : rawRows;
-        return { rows: verified, matchMode: 'expanded_metadata_fts' };
+        const captionMatchIds = new Set(
+          verified.filter((r) => billCaptionContainsAnyPhrase(r, combinedTerms)).map((r) => r.id)
+        );
+        return { rows: verified, captionMatchIds, matchMode: 'expanded_metadata_fts' };
       } catch {
         // Fall through to exact FTS below
       }
     }
   }
 
-  const runFtsForTokens = (toks: string[]): BillDbRow[] => {
-    if (toks.length === 0) return [];
+  const runFtsForTokens = (toks: string[]): { rows: BillDbRow[]; captionMatchIds: Set<string> } => {
+    if (toks.length === 0) return { rows: [], captionMatchIds: new Set() };
     const ftsExpr = buildFtsFromNaturalText(toks.join(' '), metadataOnly);
-    if (!ftsExpr) return [];
+    if (!ftsExpr) return { rows: [], captionMatchIds: new Set() };
     try {
       const whereSql = conditions.length ? `AND ${conditions.join(' AND ')}` : '';
       const rawRows = db
@@ -682,47 +708,55 @@ function queryBillsMatchingText(
            ORDER BY b.influence_score DESC, b.last_action_date DESC`
         )
         .all(ftsExpr, ...params) as BillDbRow[];
-      return metadataOnly ? rawRows.filter((r) => billMetadataContainsTokens(r, toks)) : rawRows;
+      const verified = metadataOnly ? rawRows.filter((r) => billMetadataContainsTokens(r, toks)) : rawRows;
+      const captionMatchIds = new Set(
+        verified.filter((r) => billCaptionContainsTokens(r, toks)).map((r) => r.id)
+      );
+      return { rows: verified, captionMatchIds };
     } catch {
-      return [];
+      return { rows: [], captionMatchIds: new Set() };
     }
   };
 
-  // 2. Column-restricted FTS5 on all query tokens (strictly metadata columns + word-boundary verified)
-  const exactRows = runFtsForTokens(tokens);
-  if (exactRows.length > 0) {
-    return { rows: exactRows, matchMode: 'exact_metadata_fts' };
+  // 2. Column-restricted FTS5 on all query tokens (strictly title/summary/subjects + word-boundary verified)
+  const exactRes = runFtsForTokens(tokens);
+  if (exactRes.rows.length > 0) {
+    return { rows: exactRes.rows, captionMatchIds: exactRes.captionMatchIds, matchMode: 'exact_metadata_fts' };
   }
 
   // 3. If generic intent modifiers (e.g. "regulation", "laws", "rules") caused 0 hits on strict AND,
   // retry with just the substantive subject tokens (still strictly metadata + word-boundary verified)
   if (coreTokens.length > 0 && coreTokens.length < tokens.length) {
-    const coreRows = runFtsForTokens(coreTokens);
-    if (coreRows.length > 0) {
-      return { rows: coreRows, matchMode: 'exact_metadata_fts' };
+    const coreRes = runFtsForTokens(coreTokens);
+    if (coreRes.rows.length > 0) {
+      return { rows: coreRes.rows, captionMatchIds: coreRes.captionMatchIds, matchMode: 'exact_metadata_fts' };
     }
   }
 
   // 4. Safe metadata-only LIKE fallback ONLY for phrases >= 4 chars (never short tokens like "AI"),
-  // strictly verified with word-boundary matching so substrings like "Affairs" never leak
+  // strictly verified with word-boundary matching on title/summary/subjects (excludes statute_codes & full_text)
   if (trimmed.length >= 4 && tokens.every((t) => t.length >= 4)) {
     const likeExpr = metadataOnly
-      ? `(LOWER(b.title) LIKE LOWER(?) OR LOWER(b.summary) LIKE LOWER(?) OR LOWER(b.subjects_json) LIKE LOWER(?) OR LOWER(b.statute_codes) LIKE LOWER(?))`
+      ? `(LOWER(b.title) LIKE LOWER(?) OR LOWER(b.summary) LIKE LOWER(?) OR LOWER(b.subjects_json) LIKE LOWER(?))`
       : `(LOWER(b.title) LIKE LOWER(?) OR LOWER(b.summary) LIKE LOWER(?) OR LOWER(b.subjects_json) LIKE LOWER(?) OR LOWER(b.full_text) LIKE LOWER(?))`;
     const likeCond = [...conditions, likeExpr];
     const pat = `%${trimmed}%`;
+    const likeParams = metadataOnly ? [pat, pat, pat] : [pat, pat, pat, pat];
     const rows = db
       .prepare(
         `SELECT b.* FROM bills b WHERE ${likeCond.join(' AND ')} ORDER BY b.influence_score DESC, b.last_action_date DESC`
       )
-      .all(...params, pat, pat, pat, pat) as BillDbRow[];
+      .all(...params, ...likeParams) as BillDbRow[];
     const verified = metadataOnly ? rows.filter((r) => billMetadataContainsTokens(r, tokens)) : rows;
     if (verified.length > 0) {
-      return { rows: verified, matchMode: 'exact_metadata_fts' };
+      const captionMatchIds = new Set(
+        verified.filter((r) => billCaptionContainsTokens(r, tokens)).map((r) => r.id)
+      );
+      return { rows: verified, captionMatchIds, matchMode: 'exact_metadata_fts' };
     }
   }
 
-  return { rows: [], matchMode: 'exact_metadata_fts' };
+  return { rows: [], captionMatchIds: new Set<string>(), matchMode: 'exact_metadata_fts' };
 }
 
 function toolSearchAndCountBills(
@@ -759,7 +793,7 @@ function toolSearchAndCountBills(
   const sortBy = args.sortBy || 'influence';
   const limit = Math.min(25, Math.max(1, Number(args.limit) || 12));
 
-  const { rows: rawRows, matchMode } = queryBillsMatchingText(query, {
+  const { rows: rawRows, captionMatchIds, matchMode } = queryBillsMatchingText(query, {
     session: session || undefined,
     chamber: chamber || undefined,
     stage: stage || undefined,
@@ -778,7 +812,8 @@ function toolSearchAndCountBills(
       row.last_action,
       committees.length
     );
-    return { row, committees, outcome, outcomeDetail };
+    const isCaptionMatch = Boolean(query) && captionMatchIds.has(row.id);
+    return { row, committees, outcome, outcomeDetail, isCaptionMatch };
   });
 
   let filtered = enriched;
@@ -789,7 +824,9 @@ function toolSearchAndCountBills(
     filtered = filtered.filter((e) => e.outcomeDetail.toLowerCase().includes(dispositionFilter));
   }
 
-  // Apply explicit sorting requested by the user/LLM
+  // Apply explicit sorting requested by the user/LLM.
+  // For default topic searches (sortBy === 'influence' with a topic query), rank primary
+  // caption matches above secondary subject-tag-only matches so omnibus bills sink below direct bills.
   if (sortBy === 'bipartisan') {
     filtered.sort(
       (a, b) =>
@@ -810,6 +847,13 @@ function toolSearchAndCountBills(
     );
   } else if (sortBy === 'recent') {
     filtered.sort((a, b) => (b.row.last_action_date || '').localeCompare(a.row.last_action_date || ''));
+  } else if (query) {
+    filtered.sort(
+      (a, b) =>
+        Number(b.isCaptionMatch) - Number(a.isCaptionMatch) ||
+        (b.row.influence_score || 0) - (a.row.influence_score || 0) ||
+        (b.row.last_action_date || '').localeCompare(a.row.last_action_date || '')
+    );
   }
 
   const bySessionMap = new Map<
@@ -856,7 +900,7 @@ function toolSearchAndCountBills(
     }
   }
 
-  const topBills = filtered.slice(0, limit).map(({ row, outcome, outcomeDetail }) => {
+  const topBills = filtered.slice(0, limit).map(({ row, outcome, outcomeDetail, isCaptionMatch }) => {
     registerBillCitation(ctx, row);
     return {
       id: row.id,
@@ -873,6 +917,7 @@ function toolSearchAndCountBills(
       amendmentCount: row.amendment_count || 0,
       filedDate: row.filed_date,
       lastActionDate: row.last_action_date,
+      ...(query ? { matchBasis: isCaptionMatch ? 'caption' : 'subject' } : {}),
     };
   });
 
@@ -883,11 +928,13 @@ function toolSearchAndCountBills(
   const totalBillsAllSessions = (db.prepare(`SELECT COUNT(*) AS c FROM bills`).get() as { c: number }).c;
 
   const isUpcomingSession = session ? parseInt(session, 10) >= 90 : false;
+  const captionMatchesCount = query ? filtered.filter((e) => e.isCaptionMatch).length : filtered.length;
 
   const payload = {
     query: query || '(all bills matching filters)',
-    searchColumns: 'title, summary, subjects, statute_codes (excludes full_text)',
+    searchColumns: 'title, subjects, non-placeholder summary (excludes full_text and statute_codes)',
     matchMode,
+    ...(query ? { captionMatchesCount, subjectOnlyMatchesCount: filtered.length - captionMatchesCount } : {}),
     filters: {
       session: session || 'ALL SESSIONS',
       chamber: chamber || 'ALL',
