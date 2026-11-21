@@ -7,6 +7,7 @@ import {
   refreshSessionCounts,
   syncAmendmentFts,
   syncBillFts,
+  syncRuleFts,
 } from './db.ts';
 import { TEXAS_CODE_CATALOG, extractActsSessions } from './statutes.ts';
 
@@ -1801,6 +1802,394 @@ export function seedBillDocumentsIfEmpty(): void {
     }
   }
 }
+
+export function seedSupplementalFiscalNotes(): void {
+  const supplemental = [
+    {
+      id: '89R-HB3000-doc-fiscal-F',
+      billId: '89R-HB3000',
+      docType: 'fiscal_note',
+      versionCode: 'F',
+      versionLabel: 'Enrolled',
+      title: 'HB 3000 Legislative Budget Board Fiscal Note (Enrolled)',
+      summary:
+        'LBB estimates a negative impact of ($90,000,000) to General Revenue through the biennium ending August 31, 2027 for rural emergency ambulance grants administered by the Comptroller and HHSC.',
+      fullText: `FISCAL IMPACT SUMMARY (LBB)
+The bill is estimated to have a negative impact of ($90,000,000) to General Revenue through the biennium ending August 31, 2027.
+Fiscal Year    General Revenue    All Funds    FTEs
+2026           ($45,000,000)      ($45,000,000)  2.0
+2027           ($45,000,000)      ($45,000,000)  2.0
+2028           $0                 $0             0.0
+2029           $0                 $0             0.0
+2030           $0                 $0             0.0
+Local Government Impact: Rural county EMS providers and hospital districts in counties under 68,750 population may receive up to $350,000 per ambulance grant with no local match required.`,
+      source: 'TLO LBB Fiscal Note (89R)',
+    },
+    {
+      id: '89R-HB14-doc-fiscal-E',
+      billId: '89R-HB14',
+      docType: 'fiscal_note',
+      versionCode: 'E',
+      versionLabel: 'Engrossed',
+      title: 'HB 14 Legislative Budget Board Fiscal Note (Engrossed)',
+      summary:
+        'LBB estimates a negative impact of ($350,000,000) to General Revenue through the biennium ending August 31, 2027 for Texas Advanced Nuclear Energy Office matching grants and 8.0 FTEs.',
+      fullText: `FISCAL IMPACT SUMMARY (LBB)
+The bill is estimated to have a negative impact of ($350,000,000) to General Revenue through the biennium ending August 31, 2027.
+Fiscal Year    General Revenue    All Funds       FTEs
+2026           ($175,000,000)     ($175,000,000)  8.0
+2027           ($175,000,000)     ($175,000,000)  8.0
+2028           ($2,400,000)       ($2,400,000)    8.0
+2029           ($2,400,000)       ($2,400,000)    8.0
+2030           ($2,400,000)       ($2,400,000)    8.0
+Local Government Impact: No significant fiscal implication to units of local government is anticipated.`,
+      source: 'TLO LBB Fiscal Note (89R)',
+    },
+    {
+      id: '89R-HB4-doc-fiscal-E',
+      billId: '89R-HB4',
+      docType: 'fiscal_note',
+      versionCode: 'E',
+      versionLabel: 'Engrossed',
+      title: 'HB 4 Legislative Budget Board Fiscal Note (Engrossed)',
+      summary:
+        'LBB estimates a negative impact of ($28,400,000) to General Revenue through the biennium ending August 31, 2027 for transitioning STAAR assessments to through-year adaptive checkpoints.',
+      fullText: `FISCAL IMPACT SUMMARY (LBB)
+The bill is estimated to have a negative impact of ($28,400,000) to General Revenue through the biennium ending August 31, 2027.
+Fiscal Year    General Revenue    All Funds      FTEs
+2026           ($16,200,000)      ($16,200,000)  6.0
+2027           ($12,200,000)      ($12,200,000)  6.0
+2028           ($4,500,000)       ($4,500,000)   4.0
+2029           ($4,500,000)       ($4,500,000)   4.0
+2030           ($4,500,000)       ($4,500,000)   4.0
+Local Government Impact: School districts would experience modest technology readiness costs offset by reduced spring testing administration days.`,
+      source: 'TLO LBB Fiscal Note (89R)',
+    },
+    {
+      id: '89R-SB14-doc-fiscal-F',
+      billId: '89R-SB14',
+      docType: 'fiscal_note',
+      versionCode: 'F',
+      versionLabel: 'Enrolled',
+      title: 'SB 14 Legislative Budget Board Fiscal Note (Enrolled)',
+      summary:
+        'No significant fiscal implication to the State is anticipated; the Texas Regulatory Efficiency Office costs can be absorbed within existing Office of the Governor appropriations.',
+      fullText: `FISCAL IMPACT SUMMARY (LBB)
+No significant fiscal implication to the State is anticipated. Costs associated with establishing the Texas Regulatory Efficiency Office and publishing regulatory cost-benefit reviews can be absorbed using existing agency resources.
+Local Government Impact: No significant fiscal implication to units of local government is anticipated.`,
+      source: 'TLO LBB Fiscal Note (89R)',
+    },
+    {
+      id: '891-SB4-doc-fiscal-F',
+      billId: '891-SB4',
+      docType: 'fiscal_note',
+      versionCode: 'F',
+      versionLabel: 'Enrolled',
+      title: 'SB 4 (89-1) Legislative Budget Board Fiscal Note (Enrolled)',
+      summary:
+        'LBB estimates a negative impact of ($1,400,000,000) to General Revenue through the biennium ending August 31, 2027 for property tax homestead exemption expansion and school district hold-harmless payments.',
+      fullText: `FISCAL IMPACT SUMMARY (LBB)
+The bill is estimated to have a negative impact of ($1,400,000,000) to General Revenue through the biennium ending August 31, 2027 due to Foundation School Program hold-harmless payments.
+Fiscal Year    General Revenue    All Funds        FTEs
+2026           ($680,000,000)     ($680,000,000)   0.0
+2027           ($720,000,000)     ($720,000,000)   0.0
+2028           ($750,000,000)     ($750,000,000)   0.0
+2029           ($780,000,000)     ($780,000,000)   0.0
+2030           ($810,000,000)     ($810,000,000)   0.0
+Local Government Impact: Independent school districts are held harmless by increased Foundation School Program state aid.`,
+      source: 'TLO LBB Fiscal Note (891)',
+    },
+  ];
+
+  const insertDoc = db.prepare(`
+    INSERT OR IGNORE INTO bill_documents
+    (id, bill_id, doc_type, version_code, version_label, title, summary, full_text, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const checkBill = db.prepare(`SELECT id FROM bills WHERE id = ?`);
+  const hasFiscal = db.prepare(`SELECT COUNT(*) AS c FROM bill_documents WHERE bill_id = ? AND doc_type = 'fiscal_note'`);
+
+  for (const d of supplemental) {
+    if (checkBill.get(d.billId)) {
+      const existing = hasFiscal.get(d.billId) as { c: number };
+      if (existing.c === 0) {
+        insertDoc.run(d.id, d.billId, d.docType, d.versionCode, d.versionLabel, d.title, d.summary, d.fullText, d.source);
+      }
+    }
+  }
+}
+
+export function seedAgencyRulesIfEmpty(): number {
+  const existing = db.prepare(`SELECT COUNT(*) AS c FROM agency_rules`).get() as { c: number };
+  if (existing.c > 0) return 0;
+
+  const starterRules = [
+    {
+      id: 'tr-20250912-tea-hb2',
+      issueDate: '2025-09-12',
+      volume: 50,
+      issueNumber: 37,
+      pageRange: '5912-5926',
+      actionType: 'Proposed' as const,
+      agencyName: 'Texas Education Agency',
+      tacTitle: '19 TAC (Education)',
+      tacCitation: '19 TAC §61.1008, §102.1309',
+      title: 'Teacher Retention Allotment & Basic Allotment Formula Adjustments (19 TAC §61.1008)',
+      summary:
+        'TEA proposes new rules implementing House Bill 2 (89th Legislature, Regular Session) establishing district distribution formulas for the Teacher Retention Allotment ($2,500–$8,000 tiers) and special education intensity-of-service weights.',
+      statutoryAuthority:
+        'Proposed under Texas Education Code §48.051 (Basic Allotment), §48.158 (Teacher Retention Allotment), and §48.004, as amended by House Bill 2, 89th Legislature, Regular Session, 2025.',
+      fiscalNoteText:
+        'FISCAL NOTE: TEA estimates state Foundation School Program disbursements of $8,500,000,000 across the FY 2026–2027 biennium as appropriated by SB 1 contingent on HB 2. Agency administrative costs are absorbed within existing appropriations.',
+      fiscalImpactAmount: -8_500_000_000,
+      governmentGrowthNote:
+        'GOVERNMENT GROWTH IMPACT STATEMENT: Implements a new statutory allotment program created by HB 2; requires no new agency FTEs beyond authorized TEA audit staff.',
+      citedBills: ['89R HB 2', '89R SB 1'],
+      statuteCodes: ['Education Code § 48.051', 'Education Code § 48.158', 'Education Code Chapter 48'],
+      sourceUrl: 'https://www.sos.state.tx.us/texreg/index.shtml',
+      source: 'Texas Register Vol. 50, No. 37 (Texas SOS)',
+      fullText: `TITLE 19. EDUCATION
+PART 2. TEXAS EDUCATION AGENCY
+CHAPTER 61. SCHOOL DISTRICTS
+19 TAC §61.1008, §102.1309
+
+The Texas Education Agency (TEA) proposes new §61.1008 and amendments to §102.1309 concerning the Teacher Retention Allotment, Basic Allotment formula updates, and special education intensity-of-service funding tiers to implement House Bill 2, 89th Texas Legislature, Regular Session, 2025.
+
+STATUTORY AUTHORITY: Proposed under Texas Education Code §48.051, §48.158, and §48.004, as enacted and amended by HB 2 (89th Legislature).
+
+FISCAL NOTE: TEA estimates state Foundation School Program disbursements of $8,500,000,000 across the FY 2026–2027 biennium as funded through SB 1 Article III riders. Independent school districts will receive higher per-pupil basic allotments and targeted teacher salary grants.
+
+GOVERNMENT GROWTH IMPACT STATEMENT: During the first five years the proposed rules are in effect, the rules implement a new statutory program authorized by HB 2 without increasing fees or creating new regulatory penalties.`,
+    },
+    {
+      id: 'tr-20250919-cpa-sb2',
+      issueDate: '2025-09-19',
+      volume: 50,
+      issueNumber: 38,
+      pageRange: '6104-6119',
+      actionType: 'Proposed' as const,
+      agencyName: 'Comptroller of Public Accounts',
+      tacTitle: '34 TAC (Public Finance)',
+      tacCitation: '34 TAC §§18.101 - 18.118',
+      title: 'Texas Education Freedom Accounts Administration & Vendor Audits (34 TAC §§18.101 - 18.118)',
+      summary:
+        'The Comptroller proposes Chapter 18 rules implementing Senate Bill 2 (89th Legislature, Regular Session) governing Educational Assistance Organization certification, $1.0B biennial cap lottery priority tiers, and eligible tuition disbursements.',
+      statutoryAuthority:
+        'Proposed under Texas Education Code Chapter 29, Subchapter J (§29.351–§29.374), as enacted by Senate Bill 2, 89th Legislature, Regular Session, 2025.',
+      fiscalNoteText:
+        'FISCAL NOTE: State program disbursements are capped at $1,000,000,000 for the FY 2026–2027 biennium under SB 2, with $18,400,000 allocated for Comptroller vendor auditing and 42.0 FTEs.',
+      fiscalImpactAmount: -1_000_000_000,
+      governmentGrowthNote:
+        'GOVERNMENT GROWTH IMPACT STATEMENT: Creates a new Education Freedom Account regulatory framework and adds 42.0 Comptroller administrative FTEs as authorized by SB 2.',
+      citedBills: ['89R SB 2', '89R SB 1'],
+      statuteCodes: ['Education Code Chapter 29', 'Education Code § 29.351'],
+      sourceUrl: 'https://www.sos.state.tx.us/texreg/index.shtml',
+      source: 'Texas Register Vol. 50, No. 38 (Texas SOS)',
+      fullText: `TITLE 34. PUBLIC FINANCE
+PART 1. COMPTROLLER OF PUBLIC ACCOUNTS
+CHAPTER 18. TEXAS EDUCATION FREEDOM ACCOUNTS
+34 TAC §§18.101 - 18.118
+
+The Comptroller of Public Accounts proposes new §§18.101–18.118 to implement Senate Bill 2, 89th Legislature, Regular Session, 2025, establishing operational standards for certified Educational Assistance Organizations (EAOs), income-tier lottery prioritization for households below 500% FPL and students with disabilities, and annual audit requirements.
+
+STATUTORY AUTHORITY: Proposed under Texas Education Code Chapter 29, Subchapter J (§29.351–§29.374) as enacted by SB 2 (89th Legislature).
+
+FISCAL NOTE: Program expenditures are capped at $1,000,000,000 for FY 2026–2027 under SB 2 and SB 1, including $18,400,000 for Comptroller platform administration and auditing.
+
+GOVERNMENT GROWTH IMPACT STATEMENT: Establishes new program administration and adds 42.0 FTEs within the Comptroller's office as funded in the General Appropriations Act.`,
+    },
+    {
+      id: 'tr-20251003-hhsc-hb3000',
+      issueDate: '2025-10-03',
+      volume: 50,
+      issueNumber: 40,
+      pageRange: '6422-6431',
+      actionType: 'Adopted' as const,
+      agencyName: 'Texas Health and Human Services Commission',
+      tacTitle: '1 TAC (Administration)',
+      tacCitation: '1 TAC §355.8214',
+      title: 'Rural Emergency Ambulance Grant & Medicaid EMS Reimbursement Alignment (1 TAC §355.8214)',
+      summary:
+        'HHSC adopts amendments coordinating Medicaid emergency medical transport supplemental payments with rural county ambulance capital grants established under House Bill 3000 (89th Legislature).',
+      statutoryAuthority:
+        'Adopted under Texas Government Code §531.033, Human Resources Code §32.021, and House Bill 3000, 89th Legislature, Regular Session, 2025.',
+      fiscalNoteText:
+        'FISCAL NOTE: Coordinates $90,000,000 in General Revenue rural ambulance grants funded via HB 3000 and SB 1 with no additional net administrative cost to HHSC.',
+      fiscalImpactAmount: -90_000_000,
+      governmentGrowthNote:
+        'GOVERNMENT GROWTH IMPACT STATEMENT: Expands rural EMS grant eligibility without increasing state fees or restricting private ambulance operators.',
+      citedBills: ['89R HB 3000', '89R SB 1'],
+      statuteCodes: ['Government Code § 531.033', 'Human Resources Code § 32.021', 'Health and Safety Code Chapter 773'],
+      sourceUrl: 'https://www.sos.state.tx.us/texreg/index.shtml',
+      source: 'Texas Register Vol. 50, No. 40 (Texas SOS)',
+      fullText: `TITLE 1. ADMINISTRATION
+PART 15. TEXAS HEALTH AND HUMAN SERVICES COMMISSION
+CHAPTER 355. REIMBURSEMENT RATES
+1 TAC §355.8214
+
+The Texas Health and Human Services Commission (HHSC) adopts amendments to §355.8214 relating to rural emergency medical services (EMS) Medicaid supplemental reimbursement and coordination with the Rural Emergency Ambulance Grant Program established by House Bill 3000, 89th Legislature, Regular Session, 2025.
+
+STATUTORY AUTHORITY: Adopted under Government Code §531.033, Human Resources Code §32.021, and Health and Safety Code Chapter 773.
+
+FISCAL NOTE: Aligns $90,000,000 in biennial General Revenue rural ambulance capital grants under HB 3000 with Medicaid ground ambulance cost reporting; no additional HHSC administrative cost is anticipated.
+
+GOVERNMENT GROWTH IMPACT STATEMENT: Supports rural county EMS capacity in counties under 68,750 population with no new fees or private sector compliance mandates.`,
+    },
+    {
+      id: 'tr-20251010-tea-staar',
+      issueDate: '2025-10-10',
+      volume: 50,
+      issueNumber: 41,
+      pageRange: '6580-6588',
+      actionType: 'Proposed' as const,
+      agencyName: 'Texas Education Agency',
+      tacTitle: '19 TAC (Education)',
+      tacCitation: '19 TAC §101.3011',
+      title: 'Assessment Reporting & Optional Interim Checkpoint Windows (19 TAC §101.3011)',
+      summary:
+        'TEA proposes updates to STAAR interim assessment windows and online testing accommodations under Education Code Chapter 39, streamlining district reporting timelines following interim stakeholder review.',
+      statutoryAuthority:
+        'Proposed under Texas Education Code §39.023 and Chapter 39, Subchapter B, authorizing statewide student assessment administration.',
+      fiscalNoteText:
+        'FISCAL NOTE: No significant fiscal implication to the State or local school districts is anticipated for the first five years the rule is in effect.',
+      fiscalImpactAmount: 0,
+      governmentGrowthNote:
+        'GOVERNMENT GROWTH IMPACT STATEMENT: Does not create a new government program, does not require new FTEs, and reduces district administrative reporting steps.',
+      citedBills: [],
+      statuteCodes: ['Education Code § 39.023', 'Education Code Chapter 39'],
+      sourceUrl: 'https://www.sos.state.tx.us/texreg/index.shtml',
+      source: 'Texas Register Vol. 50, No. 41 (Texas SOS)',
+      fullText: `TITLE 19. EDUCATION
+PART 2. TEXAS EDUCATION AGENCY
+CHAPTER 101. ASSESSMENT
+19 TAC §101.3011
+
+The Texas Education Agency (TEA) proposes amendments to §101.3011 concerning statewide student assessment schedules and optional through-year interim checkpoint windows under Education Code Chapter 39.
+
+STATUTORY AUTHORITY: Proposed under Texas Education Code §39.023 and Education Code Chapter 39.
+
+FISCAL NOTE: No significant fiscal implication to the State is anticipated for the first five years the proposed amendments are in effect.
+
+GOVERNMENT GROWTH IMPACT STATEMENT: Streamlines existing assessment testing windows without creating new agency positions or fees.`,
+    },
+    {
+      id: 'tr-20250822-twdb-water',
+      issueDate: '2025-08-22',
+      volume: 50,
+      issueNumber: 34,
+      pageRange: '5410-5424',
+      actionType: 'Adopted' as const,
+      agencyName: 'Texas Water Development Board',
+      tacTitle: '31 TAC (Natural Resources and Conservation)',
+      tacCitation: '31 TAC §§365.11 - 365.25',
+      title: 'Texas Water Fund New Water Supply & Rural Infrastructure Allocations (31 TAC §§365.11 - 365.25)',
+      summary:
+        'TWDB adopts revised prioritization rules for the Texas Water Fund created by Senate Bill 28 (88th Legislature), updating rural water loss mitigation and marine desalination matching criteria for FY 2026–2027 appropriations.',
+      statutoryAuthority:
+        'Adopted under Texas Water Code Chapter 15, Subchapter H-1 (§15.502–§15.508), as enacted by Senate Bill 28, 88th Legislature, Regular Session.',
+      fiscalNoteText:
+        'FISCAL NOTE: Governs allocation of $2,500,000,000 in FY 2026–2027 Texas Water Fund appropriations enacted under SB 1 (89th Legislature); no new fee revenue or agency cost increase.',
+      fiscalImpactAmount: -2_500_000_000,
+      governmentGrowthNote:
+        'GOVERNMENT GROWTH IMPACT STATEMENT: Implements ongoing statutory Texas Water Fund grant and low-interest loan disbursements with existing TWDB staff.',
+      citedBills: ['88R SB 28', '89R SB 1'],
+      statuteCodes: ['Water Code Chapter 15', 'Water Code § 15.502'],
+      sourceUrl: 'https://www.sos.state.tx.us/texreg/index.shtml',
+      source: 'Texas Register Vol. 50, No. 34 (Texas SOS)',
+      fullText: `TITLE 31. NATURAL RESOURCES AND CONSERVATION
+PART 10. TEXAS WATER DEVELOPMENT BOARD
+CHAPTER 365. TEXAS WATER FUND
+31 TAC §§365.11 - 365.25
+
+The Texas Water Development Board (TWDB) adopts amendments to §§365.11–365.25 updating funding allocation criteria for the New Water Supply for Texas Fund and rural municipal water loss mitigation projects originally authorized under Senate Bill 28 (88th Legislature) and expanded in Senate Bill 1 (89th Legislature).
+
+STATUTORY AUTHORITY: Adopted under Texas Water Code Chapter 15 (§15.502–§15.508).
+
+FISCAL NOTE: Directs $2,500,000,000 in biennial appropriations for water supply and infrastructure financing; no additional state administrative cost is projected.
+
+GOVERNMENT GROWTH IMPACT STATEMENT: Continues an existing statutory infrastructure financing program without expanding regulatory restrictions.`,
+    },
+    {
+      id: 'tr-20250926-puc-ercot',
+      issueDate: '2025-09-26',
+      volume: 50,
+      issueNumber: 39,
+      pageRange: '6255-6268',
+      actionType: 'Adopted' as const,
+      agencyName: 'Public Utility Commission of Texas',
+      tacTitle: '16 TAC (Economic Regulation)',
+      tacCitation: '16 TAC §25.55, §25.510',
+      title: 'ERCOT Weather Emergency Preparedness & Texas Energy Fund Dispatchable Loan Standards (16 TAC §25.55)',
+      summary:
+        'PUC adopts updated ERCOT winter weatherization inspection standards originating from Senate Bill 3 (87th Legislature) alongside dispatchable generation interconnection timelines for Texas Energy Fund recipients.',
+      statutoryAuthority:
+        'Adopted under Texas Utilities Code §35.0021, §34.0104, and Senate Bill 3 (87th Legislature, Regular Session).',
+      fiscalNoteText:
+        'FISCAL NOTE: No significant fiscal implication to General Revenue is anticipated; PUC inspection activities are funded within existing Public Utility Commission appropriations.',
+      fiscalImpactAmount: 0,
+      governmentGrowthNote:
+        'GOVERNMENT GROWTH IMPACT STATEMENT: Refines mandatory weatherization inspection schedules for ERCOT generation and transmission entities without adding agency FTEs.',
+      citedBills: ['87R SB 3'],
+      statuteCodes: ['Utilities Code § 35.0021', 'Utilities Code Chapter 34'],
+      sourceUrl: 'https://www.sos.state.tx.us/texreg/index.shtml',
+      source: 'Texas Register Vol. 50, No. 39 (Texas SOS)',
+      fullText: `TITLE 16. ECONOMIC REGULATION
+PART 2. PUBLIC UTILITY COMMISSION OF TEXAS
+CHAPTER 25. SUBSTANTIVE RULES APPLICABLE TO ELECTRIC SERVICE PROVIDERS
+16 TAC §25.55, §25.510
+
+The Public Utility Commission of Texas (PUC) adopts amendments to §25.55 (Weather Emergency Preparedness) implementing ongoing ERCOT reliability mandates from Senate Bill 3, 87th Legislature, Regular Session, and updating Texas Energy Fund dispatchable generation milestones under §25.510.
+
+STATUTORY AUTHORITY: Adopted under Texas Utilities Code §35.0021 and Chapter 34.
+
+FISCAL NOTE: No significant fiscal implication to the State is anticipated. Compliance inspections are executed by existing PUC reliability staff.
+
+GOVERNMENT GROWTH IMPACT STATEMENT: Maintains statutory grid weatherization standards without creating new fees or expanding agency headcount.`,
+    },
+  ];
+
+  // Dynamically import upsertParsedAgencyRules via direct DB upsert to avoid circular dependency
+  const stmt = db.prepare(
+    `INSERT OR IGNORE INTO agency_rules (
+      id, issue_date, volume, issue_number, page_range, action_type, agency_name,
+      tac_title, tac_citation, title, summary, statutory_authority,
+      fiscal_note_text, fiscal_impact_amount, government_growth_note,
+      cited_bills_json, statute_codes_json, source_url, source, full_text, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const now = new Date().toISOString();
+  const tx = db.transaction(() => {
+    for (const r of starterRules) {
+      stmt.run(
+        r.id,
+        r.issueDate,
+        r.volume,
+        r.issueNumber,
+        r.pageRange,
+        r.actionType,
+        r.agencyName,
+        r.tacTitle,
+        r.tacCitation,
+        r.title,
+        r.summary,
+        r.statutoryAuthority,
+        r.fiscalNoteText,
+        r.fiscalImpactAmount,
+        r.governmentGrowthNote,
+        JSON.stringify(r.citedBills),
+        JSON.stringify(r.statuteCodes),
+        r.sourceUrl,
+        r.source,
+        r.fullText,
+        now
+      );
+      syncRuleFts(r.id);
+    }
+  });
+  tx();
+  return starterRules.length;
+}
+
 
 
 

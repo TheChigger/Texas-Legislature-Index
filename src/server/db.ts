@@ -349,9 +349,133 @@ export function initSchema(): void {
       cited_politicians_json TEXT NOT NULL DEFAULT '[]',
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS agency_rules (
+      id TEXT PRIMARY KEY,
+      issue_date TEXT NOT NULL,
+      volume INTEGER NOT NULL DEFAULT 0,
+      issue_number INTEGER NOT NULL DEFAULT 0,
+      page_range TEXT NOT NULL DEFAULT '',
+      action_type TEXT NOT NULL DEFAULT 'Proposed',
+      agency_name TEXT NOT NULL,
+      tac_title TEXT NOT NULL DEFAULT '',
+      tac_citation TEXT NOT NULL DEFAULT '',
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL DEFAULT '',
+      statutory_authority TEXT NOT NULL DEFAULT '',
+      fiscal_note_text TEXT NOT NULL DEFAULT '',
+      fiscal_impact_amount REAL,
+      government_growth_note TEXT NOT NULL DEFAULT '',
+      cited_bills_json TEXT NOT NULL DEFAULT '[]',
+      statute_codes_json TEXT NOT NULL DEFAULT '[]',
+      source_url TEXT NOT NULL DEFAULT '',
+      source TEXT NOT NULL DEFAULT 'Texas Register',
+      full_text TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_agency_rules_date ON agency_rules(issue_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_agency_rules_agency ON agency_rules(agency_name);
+    CREATE INDEX IF NOT EXISTS idx_agency_rules_action ON agency_rules(action_type);
+
+    CREATE TABLE IF NOT EXISTS rule_bill_links (
+      id TEXT PRIMARY KEY,
+      rule_id TEXT NOT NULL REFERENCES agency_rules(id) ON DELETE CASCADE,
+      bill_id TEXT NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+      link_basis TEXT NOT NULL,
+      matched_ref TEXT NOT NULL DEFAULT '',
+      confidence REAL NOT NULL DEFAULT 1.0,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_rule_bill_unique
+      ON rule_bill_links(rule_id, bill_id);
+    CREATE INDEX IF NOT EXISTS idx_rule_bill_by_bill ON rule_bill_links(bill_id);
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS rules_fts USING fts5(
+      rule_id UNINDEXED,
+      agency_name,
+      tac_citation,
+      title,
+      summary,
+      statutory_authority,
+      fiscal_note_text,
+      full_text,
+      tokenize = 'porter unicode61'
+    );
+
+    CREATE TABLE IF NOT EXISTS texreg_sync_jobs (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      from_date TEXT NOT NULL DEFAULT '',
+      max_issues INTEGER NOT NULL DEFAULT 8,
+      issues_discovered INTEGER NOT NULL DEFAULT 0,
+      issues_processed INTEGER NOT NULL DEFAULT 0,
+      rules_upserted INTEGER NOT NULL DEFAULT 0,
+      bill_links_created INTEGER NOT NULL DEFAULT 0,
+      current_issue TEXT NOT NULL DEFAULT '',
+      message TEXT NOT NULL DEFAULT '',
+      started_at TEXT NOT NULL,
+      completed_at TEXT
+    );
   `);
 
+  // Safe idempotent column migrations for LBB structured fiscal impact on bills
+  const billCols = new Set(
+    (db.prepare(`PRAGMA table_info(bills)`).all() as Array<{ name: string }>).map((c) => c.name)
+  );
+  const fiscalMigrations: Array<[string, string]> = [
+    ['fiscal_status', `TEXT NOT NULL DEFAULT ''`],
+    ['biennial_gr_impact', `REAL`],
+    ['five_year_gr_impact', `REAL`],
+    ['five_year_all_funds_impact', `REAL`],
+    ['fte_change', `REAL`],
+    ['local_gov_impact', `TEXT NOT NULL DEFAULT ''`],
+    ['fiscal_note_version', `TEXT NOT NULL DEFAULT ''`],
+    ['fiscal_summary', `TEXT NOT NULL DEFAULT ''`],
+  ];
+  for (const [col, def] of fiscalMigrations) {
+    if (!billCols.has(col)) {
+      db.exec(`ALTER TABLE bills ADD COLUMN ${col} ${def}`);
+    }
+  }
+
   cleanExistingIndexedHtml();
+}
+
+export function syncRuleFts(ruleId: string): void {
+  const row = db
+    .prepare(
+      `SELECT id, agency_name, tac_citation, title, summary, statutory_authority, fiscal_note_text, full_text
+       FROM agency_rules WHERE id = ?`
+    )
+    .get(ruleId) as
+    | {
+        id: string;
+        agency_name: string;
+        tac_citation: string;
+        title: string;
+        summary: string;
+        statutory_authority: string;
+        fiscal_note_text: string;
+        full_text: string;
+      }
+    | undefined;
+  if (!row) return;
+  db.prepare(`DELETE FROM rules_fts WHERE rule_id = ?`).run(ruleId);
+  db.prepare(
+    `INSERT INTO rules_fts (rule_id, agency_name, tac_citation, title, summary, statutory_authority, fiscal_note_text, full_text)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    row.id,
+    row.agency_name,
+    row.tac_citation,
+    row.title,
+    row.summary,
+    row.statutory_authority,
+    row.fiscal_note_text,
+    row.full_text
+  );
 }
 
 export function normalizeIsoDate(raw: string): string {

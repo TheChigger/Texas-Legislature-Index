@@ -27,17 +27,32 @@ import {
   listResearchHistory,
   runResearchAgent,
 } from './researchAgent.ts';
+import { backfillAllBillFiscalImpacts } from './fiscalParser.ts';
+import {
+  getLatestTexRegSyncJob,
+  parseTexasRegisterText,
+  relinkAllRulesToBills,
+  startTexRegSyncJob,
+  upsertParsedAgencyRules,
+} from './texasRegister.ts';
 import type {
+  AgencyRuleActionType,
+  AgencyRuleDetail,
+  AgencyRuleSummary,
   BillDocument,
+  BillFiscalImpact,
   BillOutcome,
+  BillRelatedRule,
   BillStage,
   BillSummary,
   Chamber,
+  FiscalStatus,
   KeywordOverlapMatch,
   KeywordTrendSeries,
   NetworkEdge,
   NetworkGraph,
   NetworkNode,
+  RuleLinkedBill,
   TimelineCohort,
   TimelineCohortBill,
   TimelineConsolidation,
@@ -86,6 +101,14 @@ interface RawBillRow {
   action_count: number;
   source: string;
   full_text: string;
+  fiscal_status?: string | null;
+  biennial_gr_impact?: number | null;
+  five_year_gr_impact?: number | null;
+  five_year_all_funds_impact?: number | null;
+  fte_change?: number | null;
+  local_gov_impact?: string | null;
+  fiscal_note_version?: string | null;
+  fiscal_summary?: string | null;
   snippet?: string;
   rank?: number;
 }
@@ -218,6 +241,26 @@ function mapBillRow(row: RawBillRow): BillSummary {
     actionCount: Number(row.action_count) || 0,
     linkCount: linkCountRow.c,
     source: safeStr(row.source),
+    fiscalImpact: {
+      status: safeStr(row.fiscal_status) as FiscalStatus,
+      biennialGrImpact:
+        row.biennial_gr_impact === null || row.biennial_gr_impact === undefined
+          ? null
+          : Number(row.biennial_gr_impact),
+      fiveYearGrImpact:
+        row.five_year_gr_impact === null || row.five_year_gr_impact === undefined
+          ? null
+          : Number(row.five_year_gr_impact),
+      fiveYearAllFundsImpact:
+        row.five_year_all_funds_impact === null || row.five_year_all_funds_impact === undefined
+          ? null
+          : Number(row.five_year_all_funds_impact),
+      fteChange:
+        row.fte_change === null || row.fte_change === undefined ? null : Number(row.fte_change),
+      localGovImpact: safeStr(row.local_gov_impact),
+      versionLabel: safeStr(row.fiscal_note_version),
+      summary: safeStr(row.fiscal_summary),
+    },
     snippet: row.snippet,
     rank: row.rank,
   };
@@ -295,6 +338,12 @@ apiRouter.get('/overview', (req, res) => {
     contributionsTotal: (db.prepare(`SELECT COALESCE(SUM(amount), 0) AS s FROM contributions`).get() as { s: number }).s,
     unreadAlerts: (db.prepare(`SELECT COUNT(*) AS c FROM alert_events WHERE is_read = 0`).get() as { c: number }).c,
     linksCount: (db.prepare(`SELECT COUNT(*) AS c FROM bill_links`).get() as { c: number }).c,
+    rulesCount: (db.prepare(`SELECT COUNT(*) AS c FROM agency_rules`).get() as { c: number }).c,
+    fiscalNotesParsed: (
+      db.prepare(`SELECT COUNT(*) AS c FROM bills WHERE fiscal_status IS NOT NULL AND fiscal_status != ''`).get() as {
+        c: number;
+      }
+    ).c,
   };
 
   const sessions = db
@@ -417,6 +466,7 @@ apiRouter.get('/bills', (req, res) => {
   const stage = String(req.query.stage ?? '').trim();
   const outcomeFilter = String(req.query.outcome ?? '').trim();
   const committee = String(req.query.committee ?? '').trim();
+  const fiscalFilter = String(req.query.fiscal ?? '').trim();
   const sort = String(req.query.sort ?? 'influence').trim();
   const parsedLimit = Number(req.query.limit);
   const limit = Number.isFinite(parsedLimit) && parsedLimit > 0
@@ -442,15 +492,26 @@ apiRouter.get('/bills', (req, res) => {
     where.push('b.committees_json LIKE ?');
     params.push(`%${committee}%`);
   }
+  if (fiscalFilter === 'significant') {
+    where.push("b.fiscal_status = 'Significant Impact'");
+  } else if (fiscalFilter === 'none') {
+    where.push("b.fiscal_status = 'No Significant Impact'");
+  } else if (fiscalFilter === 'parsed') {
+    where.push("b.fiscal_status IS NOT NULL AND b.fiscal_status != ''");
+  }
 
   const orderClause =
-    sort === 'amendments'
-      ? 'b.amendment_count DESC, b.influence_score DESC'
-      : sort === 'recent'
-        ? 'b.last_action_date DESC, b.influence_score DESC'
-        : sort === 'relevance' && q
-          ? 'bm25(bills_fts) ASC, b.influence_score DESC'
-          : 'b.influence_score DESC, b.amendment_count DESC';
+    sort === 'cost_desc'
+      ? 'CASE WHEN b.biennial_gr_impact IS NOT NULL OR b.five_year_gr_impact IS NOT NULL OR b.five_year_all_funds_impact IS NOT NULL THEN 0 ELSE 1 END ASC, ABS(COALESCE(b.biennial_gr_impact, b.five_year_gr_impact, b.five_year_all_funds_impact, 0)) DESC, b.influence_score DESC'
+      : sort === 'cost_asc'
+        ? 'CASE WHEN b.biennial_gr_impact IS NOT NULL OR b.five_year_gr_impact IS NOT NULL OR b.five_year_all_funds_impact IS NOT NULL THEN 0 ELSE 1 END ASC, COALESCE(b.biennial_gr_impact, b.five_year_gr_impact, b.five_year_all_funds_impact, 0) DESC, b.influence_score DESC'
+        : sort === 'amendments'
+          ? 'b.amendment_count DESC, b.influence_score DESC'
+          : sort === 'recent'
+            ? 'b.last_action_date DESC, b.influence_score DESC'
+            : sort === 'relevance' && q
+              ? 'bm25(bills_fts) ASC, b.influence_score DESC'
+              : 'b.influence_score DESC, b.amendment_count DESC';
 
   const finalizeResponse = (allRows: RawBillRow[], queryUsed: string) => {
     let passed = 0;
@@ -665,6 +726,19 @@ apiRouter.get('/bills/:id', (req, res) => {
     .prepare(`SELECT brief, model, updated_at AS updatedAt FROM bill_ai_briefs WHERE bill_id = ?`)
     .get(row.id) as { brief: string; model: string; updatedAt: string } | undefined;
 
+  const relatedRules = db
+    .prepare(
+      `SELECT r.id AS ruleId, r.issue_date AS issueDate, r.action_type AS actionType,
+              r.agency_name AS agencyName, r.tac_citation AS tacCitation, r.title,
+              r.fiscal_impact_amount AS fiscalImpactAmount,
+              l.link_basis AS linkBasis, l.matched_ref AS matchedRef, l.confidence
+       FROM rule_bill_links l
+       JOIN agency_rules r ON r.id = l.rule_id
+       WHERE l.bill_id = ?
+       ORDER BY l.confidence DESC, r.issue_date DESC`
+    )
+    .all(row.id) as BillRelatedRule[];
+
   res.json({
     ...bill,
     fullText: row.full_text,
@@ -680,6 +754,7 @@ apiRouter.get('/bills/:id', (req, res) => {
     constituentLogs,
     publicSentiment,
     documents,
+    relatedRules,
     aiBrief: savedBrief?.brief || '',
     aiBriefModel: savedBrief?.model || '',
     aiBriefUpdatedAt: savedBrief?.updatedAt || '',
@@ -3186,4 +3261,326 @@ apiRouter.delete('/research/history/:id', (req, res) => {
   const deleted = deleteResearchHistoryItem(req.params.id);
   if (!deleted) return res.status(404).json({ error: 'Research record not found' });
   res.json({ deleted: true });
+});
+
+// 15. Texas Register Weekly Agency Rulemaking & LBB Fiscal Impact Backfill
+interface RawAgencyRuleRow {
+  id: string;
+  issue_date: string;
+  volume: number;
+  issue_number: number;
+  page_range: string;
+  action_type: AgencyRuleActionType;
+  agency_name: string;
+  tac_title: string;
+  tac_citation: string;
+  title: string;
+  summary: string;
+  statutory_authority: string;
+  fiscal_note_text: string;
+  fiscal_impact_amount: number | null;
+  government_growth_note: string;
+  cited_bills_json: string;
+  statute_codes_json: string;
+  source_url: string;
+  source: string;
+  full_text: string;
+  created_at?: string;
+  linked_bill_count?: number;
+}
+
+function mapAgencyRuleRow(r: RawAgencyRuleRow): AgencyRuleSummary {
+  let citedBills: string[] = [];
+  let statuteCodes: string[] = [];
+  try {
+    citedBills = JSON.parse(safeStr(r.cited_bills_json, '[]'));
+  } catch {
+    citedBills = [];
+  }
+  try {
+    statuteCodes = JSON.parse(safeStr(r.statute_codes_json, '[]'));
+  } catch {
+    statuteCodes = [];
+  }
+  const previewRows = db
+    .prepare(
+      `SELECT l.bill_id AS billId, b.session, b.bill_number AS billNumber, l.link_basis AS linkBasis
+       FROM rule_bill_links l
+       JOIN bills b ON b.id = l.bill_id
+       WHERE l.rule_id = ?
+       ORDER BY l.confidence DESC, b.influence_score DESC
+       LIMIT 4`
+    )
+    .all(r.id) as AgencyRuleSummary['linkedBillsPreview'];
+
+  const linkedBillsCount =
+    r.linked_bill_count !== undefined
+      ? Number(r.linked_bill_count)
+      : (
+          db.prepare(`SELECT COUNT(*) AS c FROM rule_bill_links WHERE rule_id = ?`).get(r.id) as { c: number }
+        ).c;
+
+  return {
+    id: r.id,
+    issueDate: safeStr(r.issue_date),
+    volume: Number(r.volume) || 0,
+    issueNumber: Number(r.issue_number) || 0,
+    pageRange: safeStr(r.page_range),
+    actionType: r.action_type,
+    agencyName: safeStr(r.agency_name),
+    tacTitle: safeStr(r.tac_title),
+    tacCitation: safeStr(r.tac_citation),
+    title: safeStr(r.title),
+    summary: safeStr(r.summary),
+    statutoryAuthority: safeStr(r.statutory_authority),
+    fiscalNoteText: safeStr(r.fiscal_note_text),
+    fiscalImpactAmount:
+      r.fiscal_impact_amount === null || r.fiscal_impact_amount === undefined
+        ? null
+        : Number(r.fiscal_impact_amount),
+    governmentGrowthNote: safeStr(r.government_growth_note),
+    citedBills,
+    statuteCodes,
+    sourceUrl: safeStr(r.source_url),
+    source: safeStr(r.source),
+    linkedBillsCount,
+    linkedBillsPreview: previewRows,
+  };
+}
+
+apiRouter.get('/rules', (req, res) => {
+  const q = String(req.query.q ?? '').trim();
+  const agency = String(req.query.agency ?? '').trim();
+  const actionType = String(req.query.actionType ?? '').trim();
+  const linkedOnly = String(req.query.linkedOnly ?? '').trim() === 'true';
+  const billId = String(req.query.billId ?? '').trim();
+  const parsedLimit = Number(req.query.limit);
+  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(Math.floor(parsedLimit), 250) : 100;
+
+  const where: string[] = [];
+  const params: Array<string | number> = [];
+
+  if (agency) {
+    where.push('r.agency_name = ?');
+    params.push(agency);
+  }
+  if (actionType) {
+    where.push('r.action_type = ?');
+    params.push(actionType);
+  }
+  if (linkedOnly) {
+    where.push('EXISTS (SELECT 1 FROM rule_bill_links l WHERE l.rule_id = r.id)');
+  }
+  if (billId) {
+    where.push('EXISTS (SELECT 1 FROM rule_bill_links l WHERE l.rule_id = r.id AND l.bill_id = ?)');
+    params.push(billId);
+  }
+
+  let rows: RawAgencyRuleRow[] = [];
+  if (q) {
+    const safeFts = buildSafeFtsQuery(q);
+    let usedFts = false;
+    if (safeFts) {
+      try {
+        rows = db
+          .prepare(
+            `SELECT r.*, (SELECT COUNT(*) FROM rule_bill_links l WHERE l.rule_id = r.id) AS linked_bill_count
+             FROM rules_fts
+             JOIN agency_rules r ON r.id = rules_fts.rule_id
+             WHERE rules_fts MATCH ?
+             ${where.length ? 'AND ' + where.join(' AND ') : ''}
+             ORDER BY r.issue_date DESC, linked_bill_count DESC
+             LIMIT ?`
+          )
+          .all(safeFts, ...params, limit) as RawAgencyRuleRow[];
+        usedFts = true;
+      } catch {
+        usedFts = false;
+      }
+    }
+    if (!usedFts) {
+      where.push(
+        '(r.title LIKE ? OR r.agency_name LIKE ? OR r.tac_citation LIKE ? OR r.summary LIKE ? OR r.cited_bills_json LIKE ?)'
+      );
+      const pat = `%${q}%`;
+      params.push(pat, pat, pat, pat, pat);
+      rows = db
+        .prepare(
+          `SELECT r.*, (SELECT COUNT(*) FROM rule_bill_links l WHERE l.rule_id = r.id) AS linked_bill_count
+           FROM agency_rules r
+           WHERE ${where.join(' AND ')}
+           ORDER BY r.issue_date DESC, linked_bill_count DESC
+           LIMIT ?`
+        )
+        .all(...params, limit) as RawAgencyRuleRow[];
+    }
+  } else {
+    rows = db
+      .prepare(
+        `SELECT r.*, (SELECT COUNT(*) FROM rule_bill_links l WHERE l.rule_id = r.id) AS linked_bill_count
+         FROM agency_rules r
+         ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+         ORDER BY r.issue_date DESC, linked_bill_count DESC
+         LIMIT ?`
+      )
+      .all(...params, limit) as RawAgencyRuleRow[];
+  }
+
+  const agencies = (
+    db
+      .prepare(`SELECT DISTINCT agency_name FROM agency_rules WHERE agency_name != '' ORDER BY agency_name ASC`)
+      .all() as Array<{ agency_name: string }>
+  ).map((a) => a.agency_name);
+
+  const stats = {
+    totalRules: (db.prepare(`SELECT COUNT(*) AS c FROM agency_rules`).get() as { c: number }).c,
+    linkedRules: (db.prepare(`SELECT COUNT(DISTINCT rule_id) AS c FROM rule_bill_links`).get() as { c: number }).c,
+    totalBillLinks: (db.prepare(`SELECT COUNT(*) AS c FROM rule_bill_links`).get() as { c: number }).c,
+    agenciesCount: agencies.length,
+    issuesCount: (
+      db.prepare(`SELECT COUNT(DISTINCT issue_date) AS c FROM agency_rules WHERE issue_date != ''`).get() as {
+        c: number;
+      }
+    ).c,
+  };
+
+  res.json({
+    rules: rows.map(mapAgencyRuleRow),
+    agencies,
+    stats,
+  });
+});
+
+apiRouter.get('/rules/sync/status', (_req, res) => {
+  res.json({ job: getLatestTexRegSyncJob() });
+});
+
+apiRouter.post('/rules/sync', (req, res) => {
+  const fromDate = String(req.body?.fromDate ?? '2025-01-01').trim();
+  const maxIssues = Math.min(20, Math.max(1, Number(req.body?.maxIssues) || 4));
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDate)) {
+    return res.status(400).json({ error: 'fromDate must be YYYY-MM-DD' });
+  }
+  const job = startTexRegSyncJob({ fromDate, maxIssues });
+  res.status(202).json({ job });
+});
+
+apiRouter.post('/rules/import', (req, res) => {
+  const rawText = String(req.body?.rawText ?? '').trim();
+  const issueDate = String(req.body?.issueDate ?? new Date().toISOString().slice(0, 10)).trim();
+  const agencyName = String(req.body?.agencyName ?? '').trim();
+  const actionType = String(req.body?.actionType ?? '').trim() as AgencyRuleActionType | '';
+  const sourceUrlRaw = String(req.body?.sourceUrl ?? '').trim();
+
+  if (rawText.length < 60) {
+    return res.status(400).json({ error: 'Paste at least 60 characters of Texas Register notice text or HTML.' });
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(issueDate)) {
+    return res.status(400).json({ error: 'issueDate must be YYYY-MM-DD.' });
+  }
+
+  let safeSourceUrl = 'https://www.sos.state.tx.us/texreg/index.shtml';
+  if (sourceUrlRaw) {
+    try {
+      const u = new URL(sourceUrlRaw);
+      if (u.protocol === 'https:' || u.protocol === 'http:') {
+        safeSourceUrl = u.toString();
+      }
+    } catch {
+      return res.status(400).json({ error: 'sourceUrl must be a valid http(s) URL.' });
+    }
+  }
+
+  const allowedTypes: AgencyRuleActionType[] = ['Proposed', 'Adopted', 'Withdrawn', 'Emergency', 'Rule Review'];
+  const parsed = parseTexasRegisterText(rawText, {
+    issueDate,
+    defaultAgency: agencyName || undefined,
+    defaultActionType: allowedTypes.includes(actionType as AgencyRuleActionType)
+      ? (actionType as AgencyRuleActionType)
+      : undefined,
+    sourceUrl: safeSourceUrl,
+    source: 'Texas Register (Manual SOS Import)',
+  });
+
+  if (parsed.length === 0) {
+    return res.status(400).json({
+      error: 'Could not extract a Texas Register rulemaking notice from the pasted text. Include the TAC citation (e.g. "19 TAC §61.1008") or rule preamble.',
+    });
+  }
+
+  const { rulesUpserted, billLinksCreated } = upsertParsedAgencyRules(parsed);
+  res.status(201).json({
+    rulesUpserted,
+    billLinksCreated,
+    ruleIds: parsed.map((p) => p.id),
+  });
+});
+
+apiRouter.post('/rules/relink', (_req, res) => {
+  const billLinksCreated = relinkAllRulesToBills();
+  res.json({ ok: true, billLinksCreated });
+});
+
+apiRouter.get('/rules/:id', (req, res) => {
+  const row = db
+    .prepare(
+      `SELECT r.*, (SELECT COUNT(*) FROM rule_bill_links l WHERE l.rule_id = r.id) AS linked_bill_count
+       FROM agency_rules r WHERE r.id = ?`
+    )
+    .get(req.params.id) as RawAgencyRuleRow | undefined;
+
+  if (!row) return res.status(404).json({ error: 'Agency rule not found' });
+
+  const summary = mapAgencyRuleRow(row);
+  const linkedRows = db
+    .prepare(
+      `SELECT l.link_basis AS linkBasis, l.matched_ref AS matchedRef, l.confidence,
+              b.*
+       FROM rule_bill_links l
+       JOIN bills b ON b.id = l.bill_id
+       WHERE l.rule_id = ?
+       ORDER BY l.confidence DESC, b.influence_score DESC`
+    )
+    .all(row.id) as Array<RawBillRow & { linkBasis: string; matchedRef: string; confidence: number }>;
+
+  const linkedBills: RuleLinkedBill[] = linkedRows.map((lr) => {
+    const mapped = mapBillRow(lr);
+    return {
+      billId: mapped.id,
+      session: mapped.session,
+      billNumber: mapped.billNumber,
+      title: mapped.title,
+      stage: mapped.stage,
+      outcome: mapped.outcome,
+      outcomeDetail: mapped.outcomeDetail,
+      primaryAuthor: mapped.primaryAuthor,
+      biennialGrImpact: mapped.fiscalImpact.biennialGrImpact,
+      fiscalStatus: mapped.fiscalImpact.status,
+      linkBasis: lr.linkBasis as RuleLinkedBill['linkBasis'],
+      matchedRef: lr.matchedRef,
+      confidence: Number(lr.confidence),
+    };
+  });
+
+  const detail: AgencyRuleDetail = {
+    ...summary,
+    fullText: safeStr(row.full_text),
+    createdAt: safeStr(row.created_at),
+    linkedBills,
+  };
+  res.json(detail);
+});
+
+apiRouter.delete('/rules/:id', (req, res) => {
+  const existing = db.prepare(`SELECT id FROM agency_rules WHERE id = ?`).get(req.params.id);
+  if (!existing) return res.status(404).json({ error: 'Agency rule not found' });
+  db.prepare(`DELETE FROM rules_fts WHERE rule_id = ?`).run(req.params.id);
+  db.prepare(`DELETE FROM rule_bill_links WHERE rule_id = ?`).run(req.params.id);
+  db.prepare(`DELETE FROM agency_rules WHERE id = ?`).run(req.params.id);
+  res.json({ deleted: true });
+});
+
+apiRouter.post('/fiscal/recompute', (_req, res) => {
+  const updated = backfillAllBillFiscalImpacts(true);
+  res.json({ ok: true, billsUpdated: updated });
 });

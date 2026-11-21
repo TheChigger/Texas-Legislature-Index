@@ -13,6 +13,7 @@ import {
   Sparkles,
   RefreshCw,
   FileSpreadsheet,
+  ArrowUpRight,
 } from 'lucide-react';
 import type {
   BillDetail,
@@ -25,6 +26,17 @@ import { RedlineDiffPane } from './RedlineDiffPane.tsx';
 import { OutcomeIndicator } from './OutcomeIndicator.tsx';
 import { csvDateStamp, downloadCsv } from '../utils/csv.ts';
 
+function formatFiscalDollars(amount: number | null | undefined): string {
+  if (amount === null || amount === undefined || !Number.isFinite(amount)) return '—';
+  if (amount === 0) return '$0';
+  const sign = amount < 0 ? '-' : '+';
+  const abs = Math.abs(amount);
+  if (abs >= 1_000_000_000) return `${sign}$${(abs / 1_000_000_000).toFixed(2)}B`;
+  if (abs >= 1_000_000) return `${sign}$${(abs / 1_000_000).toFixed(1)}M`;
+  if (abs >= 1_000) return `${sign}$${Math.round(abs / 1_000).toLocaleString()}K`;
+  return `${sign}$${Math.round(abs).toLocaleString()}`;
+}
+
 interface LegislationViewProps {
   overview: OverviewResponse | null;
   activeSession: string;
@@ -32,6 +44,7 @@ interface LegislationViewProps {
   onSelectBill: (billId: string) => void;
   onInspectPoliticianName: (shortName: string) => void;
   onInspectInNetwork: (billId: string) => void;
+  onOpenRule: (ruleId: string) => void;
   onOpenTloSync: () => void;
   onOpenNewBill: () => void;
   refreshSignal: number;
@@ -54,6 +67,7 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
   onSelectBill,
   onInspectPoliticianName,
   onInspectInNetwork,
+  onOpenRule,
   onOpenTloSync,
   onOpenNewBill,
   refreshSignal,
@@ -63,7 +77,8 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
   const [chamber, setChamber] = useState('');
   const [stage, setStage] = useState('');
   const [outcome, setOutcome] = useState<'' | BillOutcome>('');
-  const [sort, setSort] = useState<'influence' | 'relevance' | 'amendments' | 'recent'>('influence');
+  const [fiscalFilter, setFiscalFilter] = useState<'' | 'significant' | 'none' | 'parsed'>('');
+  const [sort, setSort] = useState<'influence' | 'relevance' | 'cost_desc' | 'cost_asc' | 'amendments' | 'recent'>('influence');
 
   const [bills, setBills] = useState<BillSummary[]>([]);
   const [outcomeSummary, setOutcomeSummary] = useState<{
@@ -77,7 +92,7 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
 
   const [detail, setDetail] = useState<BillDetail | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
-  const [dossierTab, setDossierTab] = useState<'overview' | 'amendments' | 'links' | 'public' | 'actions'>('overview');
+  const [dossierTab, setDossierTab] = useState<'overview' | 'amendments' | 'links' | 'rules' | 'public' | 'actions'>('overview');
   const [witnessPosFilter, setWitnessPosFilter] = useState<'ALL' | 'For' | 'Against' | 'On'>('ALL');
 
   // Cross-bill linking form
@@ -117,6 +132,7 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
       if (chamber) params.set('chamber', chamber);
       if (stage) params.set('stage', stage);
       if (outcome) params.set('outcome', outcome);
+      if (fiscalFilter) params.set('fiscal', fiscalFilter);
       params.set('sort', query.trim() && sort === 'influence' ? 'relevance' : sort);
 
       fetch(`/api/bills?${params.toString()}`, { signal: controller.signal })
@@ -137,7 +153,7 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
       clearTimeout(timer);
       controller.abort();
     };
-  }, [query, activeSession, chamber, stage, outcome, sort, refreshSignal]);
+  }, [query, activeSession, chamber, stage, outcome, fiscalFilter, sort, refreshSignal]);
 
   // Fetch active bill dossier
   const loadBillDetail = (billId: string) => {
@@ -280,67 +296,76 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
         if (activeSession) params.set('session', activeSession);
         if (chamber) params.set('chamber', chamber);
         if (stage) params.set('stage', stage);
-        if (outcome) params.set('outcome', outcome);
-        params.set('sort', query.trim() && sort === 'influence' ? 'relevance' : sort);
-        params.set('limit', '10000');
-        const res = await fetch(`/api/bills?${params.toString()}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (Array.isArray(data.bills)) rowsToExport = data.bills;
+          if (outcome) params.set('outcome', outcome);
+          if (fiscalFilter) params.set('fiscal', fiscalFilter);
+          params.set('sort', query.trim() && sort === 'influence' ? 'relevance' : sort);
+          params.set('limit', '10000');
+          const res = await fetch(`/api/bills?${params.toString()}`);
+          if (res.ok) {
+            const data = await res.json();
+            if (Array.isArray(data.bills)) rowsToExport = data.bills;
+          }
         }
-      }
 
-      downloadCsv(
-        `texas-bills-${activeSession || 'all'}-${csvDateStamp()}.csv`,
-        [
-          'Session',
-          'Bill Number',
-          'Chamber',
-          'Stage',
-          'Outcome',
-          'Outcome Detail',
-          'Title',
-          'Primary Author',
-          'Co-Authors',
-          'Sponsors',
-          'Committees',
-          'Subjects',
-          'Statute Codes',
-          'Influence Score',
-          'Momentum',
-          'Versions',
-          'Actions',
-          'Links',
-          'Filed Date',
-          'Last Action Date',
-          'Last Action',
-          'Source',
-        ],
-        rowsToExport.map((b) => [
-          b.session,
-          b.billNumber,
-          b.chamber,
-          b.stage,
-          b.outcome,
-          b.outcomeDetail,
-          b.title,
-          b.primaryAuthor,
-          b.coauthors,
-          b.sponsors,
-          b.committees.map((c) => `${c.chamber} ${c.name} (${c.status})`),
-          b.subjects,
-          b.statuteCodes,
-          b.influenceScore.toFixed(1),
-          b.momentumLabel,
-          b.amendmentCount,
-          b.actionCount,
-          b.linkCount,
-          b.filedDate,
-          b.lastActionDate,
-          b.lastAction,
-          b.source,
-        ])
-      );
+        downloadCsv(
+          `texas-bills-${activeSession || 'all'}-${csvDateStamp()}.csv`,
+          [
+            'Session',
+            'Bill Number',
+            'Chamber',
+            'Stage',
+            'Outcome',
+            'Outcome Detail',
+            'LBB Fiscal Status',
+            '2-Yr GR Impact ($)',
+            '5-Yr All Funds ($)',
+            'FTE Change',
+            'Title',
+            'Primary Author',
+            'Co-Authors',
+            'Sponsors',
+            'Committees',
+            'Subjects',
+            'Statute Codes',
+            'Influence Score',
+            'Momentum',
+            'Versions',
+            'Actions',
+            'Links',
+            'Filed Date',
+            'Last Action Date',
+            'Last Action',
+            'Source',
+          ],
+          rowsToExport.map((b) => [
+            b.session,
+            b.billNumber,
+            b.chamber,
+            b.stage,
+            b.outcome,
+            b.outcomeDetail,
+            b.fiscalImpact?.status || '',
+            b.fiscalImpact?.biennialGrImpact ?? '',
+            b.fiscalImpact?.fiveYearAllFundsImpact ?? '',
+            b.fiscalImpact?.fteChange ?? '',
+            b.title,
+            b.primaryAuthor,
+            b.coauthors,
+            b.sponsors,
+            b.committees.map((c) => `${c.chamber} ${c.name} (${c.status})`),
+            b.subjects,
+            b.statuteCodes,
+            b.influenceScore.toFixed(1),
+            b.momentumLabel,
+            b.amendmentCount,
+            b.actionCount,
+            b.linkCount,
+            b.filedDate,
+            b.lastActionDate,
+            b.lastAction,
+            b.source,
+          ])
+        );
     } finally {
       setExportingCsv(false);
     }
@@ -644,11 +669,25 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
             </select>
 
             <select
+              value={fiscalFilter}
+              onChange={(e) => setFiscalFilter(e.target.value as typeof fiscalFilter)}
+              aria-label="Filter by LBB fiscal impact"
+              className="px-3 py-1.5 text-xs bg-[#FFFFFF] border border-[#C5BDB0] text-[#181715] rounded"
+            >
+              <option value="">All Fiscal Notes</option>
+              <option value="significant">LBB: Significant Cost / Impact</option>
+              <option value="none">LBB: No Significant Impact</option>
+              <option value="parsed">Has Parsed Fiscal Note</option>
+            </select>
+
+            <select
               value={sort}
               onChange={(e) => setSort(e.target.value as typeof sort)}
               className="px-3 py-1.5 text-xs bg-[#FFFFFF] border border-[#C5BDB0] text-[#181715] rounded"
             >
               <option value="influence">Sort: Influence Index</option>
+              <option value="cost_desc">Sort: Highest Fiscal Cost</option>
+              <option value="cost_asc">Sort: Lowest Cost / Savings</option>
               <option value="relevance">Sort: Keyword Relevance (BM25)</option>
               <option value="amendments">Sort: Most Amended</option>
               <option value="recent">Sort: Latest Action Date</option>
@@ -776,6 +815,7 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
                   setChamber('');
                   setStage('');
                   setOutcome('');
+                  setFiscalFilter('');
                 }}
                 className="px-3 py-1.5 text-xs font-medium border border-[#C5BDB0] rounded hover:border-[#181715] cursor-pointer"
               >
@@ -832,6 +872,28 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
 
                     <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-[#78716C] font-mono tabular-nums">
                       <span>Author: {b.primaryAuthor}</span>
+                      {b.fiscalImpact?.status && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span
+                            className={
+                              b.fiscalImpact.biennialGrImpact != null && b.fiscalImpact.biennialGrImpact < 0
+                                ? 'text-[#991B1B] font-semibold'
+                                : b.fiscalImpact.biennialGrImpact != null && b.fiscalImpact.biennialGrImpact > 0
+                                  ? 'text-[#14532D] font-semibold'
+                                  : 'text-[#57534E]'
+                            }
+                          >
+                            {b.fiscalImpact.biennialGrImpact != null
+                              ? `${formatFiscalDollars(b.fiscalImpact.biennialGrImpact)} GR`
+                              : b.fiscalImpact.fiveYearAllFundsImpact != null
+                                ? `${formatFiscalDollars(b.fiscalImpact.fiveYearAllFundsImpact)} All Funds`
+                                : b.fiscalImpact.status === 'No Significant Impact'
+                                  ? 'No Sig. Cost'
+                                  : b.fiscalImpact.status}
+                          </span>
+                        </>
+                      )}
                       <span aria-hidden="true">·</span>
                       <span>{b.amendmentCount} versions</span>
                       <span aria-hidden="true">·</span>
@@ -993,9 +1055,10 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
                 {/* Dossier Sub-Tabs */}
                 <div className="mt-5 flex items-center gap-6 border-t border-[#DFD9CE] pt-3 overflow-x-auto">
                   {[
-                    { id: 'overview', label: 'Statutory Text & Influence' },
+                    { id: 'overview', label: 'Statutory Text & Fiscal' },
                     { id: 'amendments', label: `Amendments & Redlines (${detail.amendments.length})` },
                     { id: 'links', label: `Cross-Bill Links (${detail.links.length + detail.keywordOverlaps.length})` },
+                    { id: 'rules', label: `Agency Rules (${detail.relatedRules?.length ?? 0})` },
                     {
                       id: 'public',
                       label: `Public Testimony & Outreach (${detail.witnesses.length + detail.constituentLogs.length})`,
@@ -1038,6 +1101,113 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
                         <span>{detail.subjects.join(' · ') || 'Uncategorized'}</span>
                       </div>
                     </div>
+
+                    {/* Structured LBB Fiscal Impact Panel */}
+                    {detail.fiscalImpact?.status && (
+                      <div className="border-t border-[#DFD9CE] pt-4 space-y-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <h3 className="text-xs font-condensed uppercase tracking-wider text-[#57534E]">
+                            LBB Fiscal Note Impact ({detail.fiscalImpact.status})
+                          </h3>
+                          {detail.fiscalImpact.versionLabel && (
+                            <span className="text-[11px] font-mono text-[#78716C]">
+                              Basis: {detail.fiscalImpact.versionLabel}
+                            </span>
+                          )}
+                        </div>
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono tabular-nums">
+                          <div className="p-2.5 bg-[#FBF9F5] border border-[#DFD9CE]">
+                            <div className="text-[#78716C]">2-Year GR Impact</div>
+                            <div
+                              className={`text-sm font-semibold mt-0.5 ${
+                                detail.fiscalImpact.biennialGrImpact != null && detail.fiscalImpact.biennialGrImpact < 0
+                                  ? 'text-[#991B1B]'
+                                  : detail.fiscalImpact.biennialGrImpact != null && detail.fiscalImpact.biennialGrImpact > 0
+                                    ? 'text-[#14532D]'
+                                    : 'text-[#181715]'
+                              }`}
+                            >
+                              {formatFiscalDollars(detail.fiscalImpact.biennialGrImpact)}
+                            </div>
+                          </div>
+                          <div className="p-2.5 bg-[#FBF9F5] border border-[#DFD9CE]">
+                            <div className="text-[#78716C]">5-Year GR Impact</div>
+                            <div className="text-sm font-semibold text-[#181715] mt-0.5">
+                              {formatFiscalDollars(detail.fiscalImpact.fiveYearGrImpact)}
+                            </div>
+                          </div>
+                          <div className="p-2.5 bg-[#FBF9F5] border border-[#DFD9CE]">
+                            <div className="text-[#78716C]">All Funds Impact</div>
+                            <div className="text-sm font-semibold text-[#181715] mt-0.5">
+                              {formatFiscalDollars(detail.fiscalImpact.fiveYearAllFundsImpact)}
+                            </div>
+                          </div>
+                          <div className="p-2.5 bg-[#FBF9F5] border border-[#DFD9CE]">
+                            <div className="text-[#78716C]">FTE Staffing Delta</div>
+                            <div className="text-sm font-semibold text-[#181715] mt-0.5">
+                              {detail.fiscalImpact.fteChange != null
+                                ? `${detail.fiscalImpact.fteChange > 0 ? '+' : ''}${detail.fiscalImpact.fteChange.toFixed(1)} FTEs`
+                                : '—'}
+                            </div>
+                          </div>
+                        </div>
+                        {detail.fiscalImpact.summary && (
+                          <p className="text-xs text-[#57534E] leading-relaxed">
+                            {detail.fiscalImpact.summary}
+                          </p>
+                        )}
+                        {detail.fiscalImpact.localGovImpact && (
+                          <p className="text-xs text-[#57534E] leading-relaxed">
+                            <span className="font-medium text-[#181715]">Local Government Impact:</span>{' '}
+                            {detail.fiscalImpact.localGovImpact}
+                          </p>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Implementing Agency Rules Quick Preview */}
+                    {detail.relatedRules && detail.relatedRules.length > 0 && (
+                      <div className="border-t border-[#DFD9CE] pt-4 space-y-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <h3 className="text-xs font-condensed uppercase tracking-wider text-[#57534E]">
+                            Linked Texas Register Agency Rulemaking ({detail.relatedRules.length})
+                          </h3>
+                          <button
+                            type="button"
+                            onClick={() => setDossierTab('rules')}
+                            className="text-xs text-[#9A3412] hover:underline cursor-pointer"
+                          >
+                            View all rules
+                          </button>
+                        </div>
+                        <div className="divide-y divide-[#DFD9CE] border border-[#DFD9CE] bg-[#FBF9F5]">
+                          {detail.relatedRules.slice(0, 3).map((rr) => (
+                            <button
+                              key={rr.ruleId}
+                              type="button"
+                              onClick={() => onOpenRule(rr.ruleId)}
+                              className="w-full p-3 text-left hover:bg-[#F4F0E8] transition-colors cursor-pointer flex items-start justify-between gap-3"
+                            >
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-mono text-[#57534E]">
+                                  <span className="font-semibold text-[#9A3412]">{rr.actionType}</span>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="font-semibold text-[#181715]">{rr.tacCitation}</span>
+                                  <span aria-hidden="true">·</span>
+                                  <span>{rr.issueDate}</span>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="text-[#1E3A5F]">{rr.linkBasis}</span>
+                                </div>
+                                <div className="text-xs text-[#181715] font-medium mt-0.5 truncate">
+                                  {rr.agencyName} — {rr.title}
+                                </div>
+                              </div>
+                              <ArrowUpRight className="w-3.5 h-3.5 text-[#78716C] shrink-0 mt-0.5" />
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
 
                     {/* Deterministic Influence Breakdown */}
                     <div className="border-t border-[#DFD9CE] pt-4">
@@ -1145,6 +1315,69 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
                       </div>
                     </div>
                   </>
+                )}
+
+                {dossierTab === 'rules' && (
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <h3 className="text-xs font-condensed uppercase tracking-wider text-[#57534E]">
+                        Linked Texas Register Agency Rulemaking ({detail.relatedRules?.length ?? 0})
+                      </h3>
+                      <span className="text-[11px] font-mono text-[#78716C]">
+                        Matched via explicit bill citations &amp; shared statutory authority
+                      </span>
+                    </div>
+
+                    {!detail.relatedRules || detail.relatedRules.length === 0 ? (
+                      <div className="p-5 border border-[#DFD9CE] bg-[#FBF9F5] text-xs text-[#57534E]">
+                        No Texas Register agency rule changes are linked to {detail.session} {detail.billNumber} yet.
+                        Sync weekly issues or paste a new Friday SOS notice from the <span className="font-medium text-[#181715]">Agency Rules</span> tab.
+                      </div>
+                    ) : (
+                      <div className="divide-y divide-[#DFD9CE] border border-[#DFD9CE] bg-[#FBF9F5]">
+                        {detail.relatedRules.map((rr) => (
+                          <button
+                            key={rr.ruleId}
+                            type="button"
+                            onClick={() => onOpenRule(rr.ruleId)}
+                            className="w-full p-4 text-left hover:bg-[#F4F0E8] transition-colors cursor-pointer flex items-start justify-between gap-4"
+                          >
+                            <div className="min-w-0 space-y-1">
+                              <div className="flex flex-wrap items-center gap-2 text-xs font-mono tabular-nums">
+                                <span className="font-semibold text-[#9A3412]">{rr.actionType}</span>
+                                <span aria-hidden="true" className="text-[#C5BDB0]">·</span>
+                                <span className="font-semibold text-[#181715]">{rr.tacCitation}</span>
+                                <span aria-hidden="true" className="text-[#C5BDB0]">·</span>
+                                <span className="text-[#57534E]">{rr.issueDate}</span>
+                                <span aria-hidden="true" className="text-[#C5BDB0]">·</span>
+                                <span className="text-[#1E3A5F]">{rr.linkBasis}</span>
+                                <span className="text-[#78716C]">({rr.matchedRef})</span>
+                              </div>
+                              <div className="text-xs font-medium text-[#1E3A5F]">{rr.agencyName}</div>
+                              <div className="text-sm font-display font-semibold text-[#181715]">
+                                {rr.title}
+                              </div>
+                              {rr.fiscalImpactAmount !== null && (
+                                <div className="text-[11px] font-mono text-[#57534E] tabular-nums">
+                                  Rule Preamble Fiscal Estimate:{' '}
+                                  <span
+                                    className={
+                                      rr.fiscalImpactAmount < 0
+                                        ? 'text-[#991B1B] font-semibold'
+                                        : 'text-[#181715] font-semibold'
+                                    }
+                                  >
+                                    {formatFiscalDollars(rr.fiscalImpactAmount)}
+                                  </span>
+                                </div>
+                              )}
+                            </div>
+                            <ArrowUpRight className="w-4 h-4 text-[#78716C] shrink-0 mt-1" />
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 )}
 
                 {dossierTab === 'amendments' && (

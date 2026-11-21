@@ -8,6 +8,7 @@ import { AmendmentsView } from './components/AmendmentsView.tsx';
 import { AlertsView } from './components/AlertsView.tsx';
 import { ReceptivityView } from './components/ReceptivityView.tsx';
 import { StatutesView } from './components/StatutesView.tsx';
+import { AgencyRulesView } from './components/AgencyRulesView.tsx';
 import { ResearchDeskView } from './components/ResearchDeskView.tsx';
 import { TloSyncModal } from './components/TloSyncModal.tsx';
 import { NewBillModal } from './components/NewBillModal.tsx';
@@ -21,6 +22,7 @@ export default function App() {
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
   const [selectedBillId, setSelectedBillId] = useState<string>('89R-HB2');
   const [selectedPoliticianId, setSelectedPoliticianId] = useState<string>('pol-buckley');
+  const [selectedRuleId, setSelectedRuleId] = useState<string>('');
   const [networkFocusId, setNetworkFocusId] = useState<string>('');
   const [refreshSignal, setRefreshSignal] = useState<number>(0);
 
@@ -41,7 +43,8 @@ export default function App() {
       '6': 'network',
       '7': 'amendments',
       '8': 'statutes',
-      '9': 'alerts',
+      '9': 'rules',
+      '0': 'alerts',
     };
 
     const focusPrimarySearch = () => {
@@ -177,6 +180,11 @@ export default function App() {
     setActiveView('network');
   };
 
+  const handleOpenRule = (ruleId: string) => {
+    setSelectedRuleId(ruleId);
+    setActiveView('rules');
+  };
+
   return (
     <div className="min-h-screen bg-[#FBF9F5] text-[#181715] flex flex-col">
       <Header
@@ -229,6 +237,12 @@ export default function App() {
               <span>{overview.totals.amendments} Versions</span>
               <span aria-hidden="true">·</span>
               <span>{overview.totals.linksCount} Links</span>
+              {typeof overview.totals.rulesCount === 'number' && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span>{overview.totals.rulesCount} Rules</span>
+                </>
+              )}
               <span aria-hidden="true">·</span>
               <span>{overview.totals.politicians} Legislators</span>
               <span aria-hidden="true">·</span>
@@ -247,6 +261,7 @@ export default function App() {
             onSelectBill={setSelectedBillId}
             onInspectPoliticianName={handleOpenPoliticianByName}
             onInspectInNetwork={handleInspectInNetwork}
+            onOpenRule={handleOpenRule}
             onOpenTloSync={() => setShowTloModal(true)}
             onOpenNewBill={() => setShowNewBillModal(true)}
             refreshSignal={refreshSignal}
@@ -320,6 +335,16 @@ export default function App() {
 
         {activeView === 'statutes' && (
           <StatutesView
+            onOpenBill={handleOpenBill}
+            refreshSignal={refreshSignal}
+            onDataMutated={triggerRefresh}
+          />
+        )}
+
+        {activeView === 'rules' && (
+          <AgencyRulesView
+            selectedRuleId={selectedRuleId}
+            onSelectRule={setSelectedRuleId}
             onOpenBill={handleOpenBill}
             refreshSignal={refreshSignal}
             onDataMutated={triggerRefresh}

@@ -12,6 +12,8 @@ import {
   upsertLegislatorRecord,
 } from './db.ts';
 import { decodeHtmlEntities, htmlToCleanPlainText } from './textClean.ts';
+import { recomputeBillFiscalImpact } from './fiscalParser.ts';
+import { relinkAllRulesToBills } from './texasRegister.ts';
 import type { BillStage, Chamber } from '../types.ts';
 
 export type TloBillType =
@@ -825,6 +827,9 @@ async function runConcurrentTloSync(params: CoreIngestParams): Promise<TloSyncRe
 
       syncBillFts(payload.billId);
       recomputeBillMetrics(payload.billId);
+      if (payload.documentRows.some((d) => d.docType === 'fiscal_note')) {
+        recomputeBillFiscalImpact(payload.billId);
+      }
       return addedLinks;
     }
   );
@@ -1190,6 +1195,7 @@ async function runConcurrentTloSync(params: CoreIngestParams): Promise<TloSyncRe
     db.prepare(`UPDATE sessions SET synced_at = ? WHERE code = ?`).run(new Date().toISOString(), session);
     backfillPoliticiansFromBills();
     refreshSessionCounts();
+    relinkAllRulesToBills();
     finalAlerts = evaluateAlertRules();
     if (job) {
       job.alertsTriggered += finalAlerts;

@@ -9,6 +9,7 @@ export type ActiveView =
   | 'network'
   | 'amendments'
   | 'statutes'
+  | 'rules'
   | 'alerts';
 
 interface HeaderProps {
@@ -33,6 +34,7 @@ export const Header: React.FC<HeaderProps> = ({
     { id: 'network', label: 'Network Map' },
     { id: 'amendments', label: 'Amendments' },
     { id: 'statutes', label: 'Statutes' },
+    { id: 'rules', label: 'Agency Rules' },
     {
       id: 'alerts',
       label: unreadAlertsCount > 0 ? `Alerts (${unreadAlertsCount})` : 'Alerts',

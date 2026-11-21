@@ -4,16 +4,28 @@ import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { backfillBipartisanIndices, db, DB_PATH, dbExistedBeforeOpen, initSchema } from './src/server/db.ts';
-import { seedDatabaseIfEmpty } from './src/server/seed.ts';
+import { seedAgencyRulesIfEmpty, seedDatabaseIfEmpty, seedSupplementalFiscalNotes } from './src/server/seed.ts';
+import { backfillAllBillFiscalImpacts } from './src/server/fiscalParser.ts';
+import { relinkAllRulesToBills } from './src/server/texasRegister.ts';
 import { apiRouter } from './src/server/routes.ts';
 import { cancelTloSyncJob, getLatestRunningTloSyncJob } from './src/server/tloFtp.ts';
 
 async function startServer() {
   initSchema();
   seedDatabaseIfEmpty();
+  seedSupplementalFiscalNotes();
   const bpBackfilled = backfillBipartisanIndices();
   if (bpBackfilled > 0) {
     console.log(`Computed bipartisan_index for ${bpBackfilled} indexed bill(s)`);
+  }
+  const fiscalBackfilled = backfillAllBillFiscalImpacts();
+  if (fiscalBackfilled > 0) {
+    console.log(`Parsed LBB fiscal impact for ${fiscalBackfilled} bill(s)`);
+  }
+  const rulesSeeded = seedAgencyRulesIfEmpty();
+  const ruleLinks = relinkAllRulesToBills();
+  if (rulesSeeded > 0 || ruleLinks > 0) {
+    console.log(`Texas Register rules ready (${rulesSeeded} seeded, ${ruleLinks} bill link(s) created)`);
   }
 
   const app = express();

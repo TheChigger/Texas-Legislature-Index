@@ -31,6 +31,23 @@ export interface InfluenceBreakdown {
   total: number;
 }
 
+export type FiscalStatus =
+  | 'Significant Impact'
+  | 'No Significant Impact'
+  | 'Indeterminate'
+  | '';
+
+export interface BillFiscalImpact {
+  status: FiscalStatus;
+  biennialGrImpact: number | null;
+  fiveYearGrImpact: number | null;
+  fiveYearAllFundsImpact: number | null;
+  fteChange: number | null;
+  localGovImpact: string;
+  versionLabel: string;
+  summary: string;
+}
+
 export interface BillSummary {
   id: string;
   session: string;
@@ -65,6 +82,7 @@ export interface BillSummary {
   amendmentCount: number;
   actionCount: number;
   linkCount: number;
+  fiscalImpact: BillFiscalImpact;
   source: string;
   snippet?: string;
   rank?: number;
@@ -175,6 +193,22 @@ export interface BillDocument {
   source: string;
 }
 
+export interface BillRelatedRule {
+  ruleId: string;
+  issueDate: string;
+  volume: number;
+  issueNumber: number;
+  actionType: AgencyRuleActionType;
+  agencyName: string;
+  tacCitation: string;
+  title: string;
+  linkBasis: 'Explicit Bill Citation' | 'Shared Statutory Authority';
+  matchedRef: string;
+  fiscalNoteText: string;
+  fiscalImpactAmount: number | null;
+  sourceUrl: string;
+}
+
 export interface BillDetail extends BillSummary {
   fullText: string;
   amendments: BillAmendment[];
@@ -185,6 +219,7 @@ export interface BillDetail extends BillSummary {
   constituentLogs: ConstituentCommunication[];
   publicSentiment: PublicSentimentSummary;
   documents?: BillDocument[];
+  relatedRules?: BillRelatedRule[];
   aiBrief?: string;
   aiBriefModel?: string;
   aiBriefUpdatedAt?: string;
@@ -423,6 +458,8 @@ export interface OverviewResponse {
     contributionsTotal: number;
     unreadAlerts: number;
     linksCount: number;
+    rulesCount?: number;
+    fiscalNotesParsed?: number;
   };
   sessions: Array<{
     code: string;
@@ -633,4 +670,78 @@ export interface ResearchQueryRecord {
   citedBills: ResearchCitedBill[];
   citedPoliticians: ResearchCitedPolitician[];
   createdAt: string;
+}
+
+export type AgencyRuleActionType =
+  | 'Proposed'
+  | 'Adopted'
+  | 'Withdrawn'
+  | 'Emergency'
+  | 'Rule Review';
+
+export interface RuleLinkedBill {
+  billId: string;
+  session: string;
+  billNumber: string;
+  title: string;
+  stage: string;
+  outcome: BillOutcome;
+  outcomeDetail: string;
+  primaryAuthor: string;
+  biennialGrImpact: number | null;
+  fiscalStatus: FiscalStatus;
+  linkBasis: 'Explicit Bill Citation' | 'Shared Statutory Authority';
+  matchedRef: string;
+  confidence: number;
+}
+
+export interface AgencyRuleSummary {
+  id: string;
+  issueDate: string;
+  volume: number;
+  issueNumber: number;
+  pageRange: string;
+  actionType: AgencyRuleActionType;
+  agencyName: string;
+  tacTitle: string;
+  tacCitation: string;
+  title: string;
+  summary: string;
+  statutoryAuthority: string;
+  fiscalNoteText: string;
+  fiscalImpactAmount: number | null;
+  governmentGrowthNote: string;
+  citedBills: string[];
+  statuteCodes: string[];
+  sourceUrl: string;
+  source: string;
+  linkedBillsCount: number;
+  linkedBillsPreview: Array<{
+    billId: string;
+    session: string;
+    billNumber: string;
+    linkBasis: 'Explicit Bill Citation' | 'Shared Statutory Authority';
+  }>;
+  snippet?: string;
+}
+
+export interface AgencyRuleDetail extends AgencyRuleSummary {
+  fullText: string;
+  createdAt: string;
+  linkedBills: RuleLinkedBill[];
+}
+
+export interface TexRegSyncJob {
+  id: string;
+  status: 'running' | 'completed' | 'failed';
+  fromDate: string;
+  maxIssues: number;
+  issuesDiscovered: number;
+  issuesProcessed: number;
+  rulesUpserted: number;
+  billLinksCreated: number;
+  currentIssue: string;
+  message: string;
+  startedAt: string;
+  completedAt: string | null;
 }

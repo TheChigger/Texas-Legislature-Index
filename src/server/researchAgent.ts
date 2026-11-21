@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { db, isProceduralCommittee } from './db.ts';
+import { formatFiscalDollars } from './fiscalParser.ts';
 import type {
   BillOutcome,
   Chamber,
@@ -406,6 +407,14 @@ interface BillDbRow {
   amendment_count: number;
   action_count: number;
   full_text: string;
+  fiscal_status?: string | null;
+  biennial_gr_impact?: number | null;
+  five_year_gr_impact?: number | null;
+  five_year_all_funds_impact?: number | null;
+  fte_change?: number | null;
+  local_gov_impact?: string | null;
+  fiscal_note_version?: string | null;
+  fiscal_summary?: string | null;
 }
 
 interface AgentExecutionContext {
@@ -555,20 +564,28 @@ function toolGetArchiveOverview(
   const politiciansCount = (db.prepare(`SELECT COUNT(*) AS c FROM politicians`).get() as { c: number }).c;
   const committeesCount = (db.prepare(`SELECT COUNT(*) AS c FROM committees`).get() as { c: number }).c;
   const statutesCount = (db.prepare(`SELECT COUNT(*) AS c FROM statute_sections`).get() as { c: number }).c;
+  const agencyRulesCount = (db.prepare(`SELECT COUNT(*) AS c FROM agency_rules`).get() as { c: number }).c;
+  const billsWithFiscalNotes = (
+    db.prepare(`SELECT COUNT(*) AS c FROM bills WHERE fiscal_status IS NOT NULL AND fiscal_status != ''`).get() as {
+      c: number;
+    }
+  ).c;
 
   return {
     payload: {
       scope: sessionFilter || 'ALL SESSIONS',
       totalBillsInScope: billRows.length,
       totalBillsAllSessions,
+      billsWithFiscalNotes,
+      agencyRulesIndexed: agencyRulesCount,
       politiciansIndexed: politiciansCount,
       committeesIndexed: committeesCount,
       statuteSectionsIndexed: statutesCount,
       sessions,
     },
     summary: sessionFilter
-      ? `${billRows.length} bills indexed in ${sessionFilter} (${totalBillsAllSessions} total across all sessions)`
-      : `${billRows.length} bills indexed across ${sessions.length} session(s), ${politiciansCount} legislators, ${committeesCount} committees`,
+      ? `${billRows.length} bills indexed in ${sessionFilter} (${totalBillsAllSessions} total across all sessions, ${agencyRulesCount} agency rules)`
+      : `${billRows.length} bills indexed across ${sessions.length} session(s), ${politiciansCount} legislators, ${agencyRulesCount} agency rules`,
     resultCount: billRows.length,
   };
 }
@@ -770,7 +787,7 @@ function toolSearchAndCountBills(
     author?: string;
     minInfluenceScore?: number;
     minBipartisanIndex?: number;
-    sortBy?: 'influence' | 'bipartisan' | 'influence_and_bipartisan' | 'amendments' | 'recent';
+    sortBy?: 'influence' | 'bipartisan' | 'influence_and_bipartisan' | 'amendments' | 'recent' | 'cost';
     limit?: number;
   },
   ctx: AgentExecutionContext
@@ -845,6 +862,18 @@ function toolSearchAndCountBills(
         (b.row.amendment_count || 0) - (a.row.amendment_count || 0) ||
         (b.row.influence_score || 0) - (a.row.influence_score || 0)
     );
+  } else if (sortBy === 'cost') {
+    filtered.sort((a, b) => {
+      const magA = Math.abs(
+        a.row.biennial_gr_impact ?? a.row.five_year_gr_impact ?? a.row.five_year_all_funds_impact ?? 0
+      );
+      const magB = Math.abs(
+        b.row.biennial_gr_impact ?? b.row.five_year_gr_impact ?? b.row.five_year_all_funds_impact ?? 0
+      );
+      const hasA = a.row.biennial_gr_impact != null || a.row.five_year_gr_impact != null || a.row.five_year_all_funds_impact != null ? 1 : 0;
+      const hasB = b.row.biennial_gr_impact != null || b.row.five_year_gr_impact != null || b.row.five_year_all_funds_impact != null ? 1 : 0;
+      return hasB - hasA || magB - magA || (b.row.influence_score || 0) - (a.row.influence_score || 0);
+    });
   } else if (sortBy === 'recent') {
     filtered.sort((a, b) => (b.row.last_action_date || '').localeCompare(a.row.last_action_date || ''));
   } else if (query) {
@@ -917,6 +946,17 @@ function toolSearchAndCountBills(
       amendmentCount: row.amendment_count || 0,
       filedDate: row.filed_date,
       lastActionDate: row.last_action_date,
+      ...(row.fiscal_status
+        ? {
+            fiscalStatus: row.fiscal_status,
+            biennialGrImpact: row.biennial_gr_impact ?? null,
+            biennialGrFormatted: formatFiscalDollars(row.biennial_gr_impact),
+            fiveYearGrImpact: row.five_year_gr_impact ?? null,
+            fiveYearAllFundsImpact: row.five_year_all_funds_impact ?? null,
+            fteChange: row.fte_change ?? null,
+            fiscalSummary: safeStr(row.fiscal_summary).slice(0, 220),
+          }
+        : {}),
       ...(query ? { matchBasis: isCaptionMatch ? 'caption' : 'subject' } : {}),
     };
   });
@@ -1703,6 +1743,17 @@ function toolGetBillDetails(
   const witnessSummary = db
     .prepare(`SELECT position, COUNT(*) AS count FROM witness_registrations WHERE bill_id = ? GROUP BY position`)
     .all(row.id);
+  const relatedAgencyRules = db
+    .prepare(
+      `SELECT r.id, r.issue_date AS issueDate, r.action_type AS actionType, r.agency_name AS agencyName,
+              r.tac_citation AS tacCitation, r.title, r.fiscal_impact_amount AS fiscalImpactAmount,
+              l.link_basis AS linkBasis, l.matched_ref AS matchedRef
+       FROM rule_bill_links l
+       JOIN agency_rules r ON r.id = l.rule_id
+       WHERE l.bill_id = ?
+       ORDER BY l.confidence DESC, r.issue_date DESC`
+    )
+    .all(row.id);
 
   return {
     payload: {
@@ -1720,12 +1771,176 @@ function toolGetBillDetails(
         statuteCodes: safeJsonArray(row.statute_codes),
         coauthors: safeJsonArray(row.coauthors_json),
         sponsors: safeJsonArray(row.sponsors_json),
+        fiscalImpact: {
+          status: safeStr(row.fiscal_status) || 'Not Indexed',
+          biennialGrImpact: row.biennial_gr_impact ?? null,
+          biennialGrFormatted: formatFiscalDollars(row.biennial_gr_impact),
+          fiveYearGrImpact: row.five_year_gr_impact ?? null,
+          fiveYearAllFundsImpact: row.five_year_all_funds_impact ?? null,
+          fiveYearAllFundsFormatted: formatFiscalDollars(row.five_year_all_funds_impact),
+          fteChange: row.fte_change ?? null,
+          localGovImpact: safeStr(row.local_gov_impact),
+          versionLabel: safeStr(row.fiscal_note_version),
+          summary: safeStr(row.fiscal_summary),
+        },
       },
       amendments,
       witnessSummary,
+      relatedAgencyRules,
     },
-    summary: `Loaded ${row.session} ${row.bill_number} (${cited.outcomeDetail})`,
+    summary: `Loaded ${row.session} ${row.bill_number} (${cited.outcomeDetail}${row.biennial_gr_impact != null ? `, LBB 2-yr GR ${formatFiscalDollars(row.biennial_gr_impact)}` : ''})`,
     resultCount: 1,
+  };
+}
+
+function toolSearchAgencyRules(
+  args: { query?: string; agency?: string; actionType?: string; billRef?: string; limit?: number },
+  ctx: AgentExecutionContext
+): { payload: Record<string, unknown>; summary: string; resultCount: number } {
+  const q = safeStr(args.query).trim();
+  const agency = safeStr(args.agency).trim();
+  const actionType = safeStr(args.actionType).trim();
+  const billRef = safeStr(args.billRef).trim();
+  const limit = Math.min(20, Math.max(1, Number(args.limit) || 10));
+
+  const conds: string[] = [];
+  const params: Array<string | number> = [];
+
+  if (agency) {
+    conds.push('LOWER(r.agency_name) LIKE LOWER(?)');
+    params.push(`%${agency}%`);
+  }
+  if (actionType) {
+    conds.push('LOWER(r.action_type) = LOWER(?)');
+    params.push(actionType);
+  }
+  if (billRef) {
+    const m = billRef.match(/\b(HB|SB|HJR|SJR|HCR|SCR)\s*(\d+)\b/i);
+    if (m) {
+      const billNum = `${m[1].toUpperCase()} ${m[2]}`;
+      conds.push(
+        `(LOWER(r.cited_bills_json) LIKE LOWER(?) OR EXISTS (SELECT 1 FROM rule_bill_links l JOIN bills b ON b.id = l.bill_id WHERE l.rule_id = r.id AND (UPPER(b.bill_number) = ? OR UPPER(b.id) = ?)))`
+      );
+      params.push(`%${billNum}%`, billNum, billRef.replace(/\s+/g, '').toUpperCase());
+    } else {
+      conds.push('LOWER(r.cited_bills_json) LIKE LOWER(?)');
+      params.push(`%${billRef}%`);
+    }
+  }
+
+  interface RuleRow {
+    id: string;
+    issue_date: string;
+    action_type: string;
+    agency_name: string;
+    tac_citation: string;
+    title: string;
+    summary: string;
+    statutory_authority: string;
+    fiscal_note_text: string;
+    fiscal_impact_amount: number | null;
+    government_growth_note: string;
+    cited_bills_json: string;
+    statute_codes_json: string;
+  }
+
+  let rows: RuleRow[] = [];
+  if (q) {
+    const fts = buildFtsFromNaturalText(q, false);
+    if (fts) {
+      try {
+        rows = db
+          .prepare(
+            `SELECT r.* FROM rules_fts
+             JOIN agency_rules r ON r.id = rules_fts.rule_id
+             WHERE rules_fts MATCH ? ${conds.length ? 'AND ' + conds.join(' AND ') : ''}
+             ORDER BY r.issue_date DESC
+             LIMIT ?`
+          )
+          .all(fts, ...params, limit) as RuleRow[];
+      } catch {
+        rows = [];
+      }
+    }
+    if (rows.length === 0) {
+      const pat = `%${q}%`;
+      const likeConds = [
+        ...conds,
+        '(LOWER(r.title) LIKE LOWER(?) OR LOWER(r.agency_name) LIKE LOWER(?) OR LOWER(r.summary) LIKE LOWER(?) OR LOWER(r.tac_citation) LIKE LOWER(?))',
+      ];
+      rows = db
+        .prepare(
+          `SELECT r.* FROM agency_rules r
+           WHERE ${likeConds.join(' AND ')}
+           ORDER BY r.issue_date DESC
+           LIMIT ?`
+        )
+        .all(...params, pat, pat, pat, pat, limit) as RuleRow[];
+    }
+  } else {
+    rows = db
+      .prepare(
+        `SELECT r.* FROM agency_rules r
+         ${conds.length ? 'WHERE ' + conds.join(' AND ') : ''}
+         ORDER BY r.issue_date DESC
+         LIMIT ?`
+      )
+      .all(...params, limit) as RuleRow[];
+  }
+
+  const mapped = rows.map((r) => {
+    const linkedBills = db
+      .prepare(
+        `SELECT b.*, l.link_basis, l.matched_ref
+         FROM rule_bill_links l
+         JOIN bills b ON b.id = l.bill_id
+         WHERE l.rule_id = ?
+         ORDER BY l.confidence DESC`
+      )
+      .all(r.id) as Array<BillDbRow & { link_basis: string; matched_ref: string }>;
+
+    const linkedSummaries = linkedBills.map((lb) => {
+      const cited = registerBillCitation(ctx, lb);
+      return {
+        billId: cited.id,
+        session: cited.session,
+        billNumber: cited.billNumber,
+        title: cited.title,
+        outcomeDetail: cited.outcomeDetail,
+        linkBasis: lb.link_basis,
+        matchedRef: lb.matched_ref,
+        biennialGrFormatted: formatFiscalDollars(lb.biennial_gr_impact),
+      };
+    });
+
+    return {
+      id: r.id,
+      issueDate: r.issue_date,
+      actionType: r.action_type,
+      agencyName: r.agency_name,
+      tacCitation: r.tac_citation,
+      title: r.title,
+      summary: r.summary,
+      fiscalImpactAmount: r.fiscal_impact_amount,
+      fiscalImpactFormatted: formatFiscalDollars(r.fiscal_impact_amount),
+      fiscalNoteText: r.fiscal_note_text,
+      governmentGrowthNote: r.government_growth_note,
+      citedBills: safeJsonArray(r.cited_bills_json),
+      linkedBills: linkedSummaries,
+    };
+  });
+
+  const totalRulesInArchive = (db.prepare(`SELECT COUNT(*) AS c FROM agency_rules`).get() as { c: number }).c;
+
+  return {
+    payload: {
+      query: q || billRef || agency || '(all indexed agency rules)',
+      totalMatches: mapped.length,
+      totalRulesInArchive,
+      rules: mapped,
+    },
+    summary: `${mapped.length} Texas Register agency rule notice${mapped.length === 1 ? '' : 's'} matched`,
+    resultCount: mapped.length,
   };
 }
 
@@ -1832,8 +2047,9 @@ const OPENAI_TOOLS = [
           },
           sortBy: {
             type: 'string',
-            enum: ['influence', 'bipartisan', 'influence_and_bipartisan', 'amendments', 'recent'],
-            description: 'Sort order. Use "influence_and_bipartisan" when the user asks for BOTH high influence and high bipartisan index.',
+            enum: ['influence', 'bipartisan', 'influence_and_bipartisan', 'amendments', 'recent', 'cost'],
+            description:
+              'Sort order. Use "cost" for most expensive / highest fiscal impact / largest budget cost bills, or "influence_and_bipartisan" when the user asks for BOTH high influence and high bipartisan index.',
           },
           limit: { type: 'number', description: 'Max bills to return in sample (default 12, max 25).' },
         },
@@ -1939,6 +2155,24 @@ const OPENAI_TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'search_agency_rules',
+      description:
+        'Search Texas Register weekly state agency rulemaking notices (Proposed, Adopted, Withdrawn, Emergency, Rule Review) with TAC citations, agency fiscal notes, government growth statements, and linked Texas bills.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Topic, TAC citation, or rulemaking keyword query.' },
+          agency: { type: 'string', description: 'Optional state agency name filter (e.g., "Education Agency", "Comptroller", "HHSC", "PUC", "Water Development").' },
+          actionType: { type: 'string', enum: ['Proposed', 'Adopted', 'Withdrawn', 'Emergency', 'Rule Review'] },
+          billRef: { type: 'string', description: 'Optional bill number like "HB 2" or "SB 2" to find agency rules implementing that bill.' },
+          limit: { type: 'number', description: 'Max rules to return (default 10).' },
+        },
+      },
+    },
+  },
 ];
 
 function executeTool(
@@ -1971,6 +2205,9 @@ function executeTool(
       break;
     case 'search_statutes':
       res = toolSearchStatutes(args as { query: string; code?: string; limit?: number }, ctx);
+      break;
+    case 'search_agency_rules':
+      res = toolSearchAgencyRules(args as Parameters<typeof toolSearchAgencyRules>[0], ctx);
       break;
     default:
       res = {
@@ -2108,6 +2345,14 @@ function runDeterministicPlan(
       lower
     );
   const isStatuteQuery = /\bstatute|statutes|code section|penal code|education code|tax code\b/i.test(lower);
+  const isAgencyRuleQuery =
+    /\b(agency\s+rules?|rule\s+changes?|rulemaking|texas\s+register|texreg|\btac\b|administrative\s+code|implementing\s+(?:hb|sb|house\s+bill|senate\s+bill))\b/i.test(
+      lower
+    );
+  const isCostQuery =
+    /\b(most\s+expensive|highest\s+cost|costliest|largest\s+(?:fiscal|budget)|fiscal\s+(?:note|impact|cost)|cost\s+of\s+(?:bill|bills)|budget\s+impact|how\s+much\s+does|how\s+much\s+did)\b/i.test(
+      lower
+    );
   const specificBillMatch = question.match(/\b(HB|SB|HJR|SJR|HCR|SCR)\s*(\d+)\b/i);
 
   const lines: string[] = [];
@@ -2121,12 +2366,41 @@ function runDeterministicPlan(
     evidence.billDetails = billRes;
     if (billRes.found && billRes.bill) {
       const b = billRes.bill as Record<string, unknown>;
+      const fi = (b.fiscalImpact || {}) as Record<string, unknown>;
       lines.push(`### ${b.session} ${b.billNumber} — ${b.title}`);
       lines.push(
         `- **Outcome / Stage:** ${b.outcomeDetail} · **Primary Author:** ${b.primaryAuthor} · **Influence:** ${b.influenceScore} · **Bipartisan Index:** ${b.bipartisanIndex}`
       );
+      if (fi.status && fi.status !== 'Not Indexed') {
+        lines.push(
+          `- **LBB Fiscal Impact (${fi.status}):** 2-Year GR **${fi.biennialGrFormatted || '—'}**${fi.fiveYearAllFundsFormatted && fi.fiveYearAllFundsFormatted !== '—' ? ` · All Funds **${fi.fiveYearAllFundsFormatted}**` : ''}${fi.fteChange != null ? ` · **${fi.fteChange} FTEs**` : ''}`
+        );
+      }
       if (b.summary) lines.push(`- **Summary:** ${b.summary}`);
       if (b.lastAction) lines.push(`- **Last Action (${b.lastActionDate}):** ${b.lastAction}`);
+    }
+  }
+
+  if (isAgencyRuleQuery) {
+    const ruleRes = executeTool(
+      'search_agency_rules',
+      {
+        ...(specificBillMatch ? { billRef: `${specificBillMatch[1].toUpperCase()} ${specificBillMatch[2]}` } : {}),
+        ...(!specificBillMatch && topic ? { query: topic } : {}),
+        limit: 10,
+      },
+      ctx
+    );
+    evidence.agencyRules = ruleRes;
+    const rules = (ruleRes.rules as Array<Record<string, unknown>>) || [];
+    lines.push(`### Texas Register Agency Rulemaking (${rules.length} matching notice${rules.length === 1 ? '' : 's'})`);
+    for (const r of rules) {
+      const linked = ((r.linkedBills as Array<Record<string, unknown>>) || [])
+        .map((lb) => `${lb.session} ${lb.billNumber} (${lb.linkBasis})`)
+        .join(', ');
+      lines.push(
+        `- **${r.tacCitation}** (${r.actionType}, ${r.issueDate}) — **${r.agencyName}**: ${r.title}${r.fiscalImpactFormatted && r.fiscalImpactFormatted !== '—' ? ` · Rule Fiscal Est.: **${r.fiscalImpactFormatted}**` : ''}${linked ? ` · Linked Bills: ${linked}` : ''}`
+      );
     }
   }
 
@@ -2217,9 +2491,10 @@ function runDeterministicPlan(
   }
 
   if (
-    (!isInfluencePersonQuery && !isCommitteeStatsQuery) ||
+    (!isInfluencePersonQuery && !isCommitteeStatsQuery && !isAgencyRuleQuery) ||
     isBipartisanQuery ||
     isHighInfluenceBillQuery ||
+    isCostQuery ||
     Boolean(disposition) ||
     /\bhow many|count\b/i.test(lower)
   ) {
@@ -2233,17 +2508,19 @@ function runDeterministicPlan(
             ? 'Vetoed'
             : undefined;
 
-    const sortBy: 'influence' | 'bipartisan' | 'influence_and_bipartisan' =
-      isBipartisanQuery && /\binfluence\b/i.test(lower)
-        ? 'influence_and_bipartisan'
-        : isBipartisanQuery
-          ? 'bipartisan'
-          : 'influence';
+    const sortBy: 'influence' | 'bipartisan' | 'influence_and_bipartisan' | 'cost' =
+      isCostQuery
+        ? 'cost'
+        : isBipartisanQuery && /\binfluence\b/i.test(lower)
+          ? 'influence_and_bipartisan'
+          : isBipartisanQuery
+            ? 'bipartisan'
+            : 'influence';
 
     const billSearch = executeTool(
       'search_and_count_bills',
       {
-        query: topic,
+        query: isCostQuery ? '' : topic,
         ...(session ? { session } : {}),
         ...(chamber ? { chamber } : {}),
         ...(outcomeParam ? { outcome: outcomeParam } : {}),
@@ -2257,7 +2534,7 @@ function runDeterministicPlan(
     );
     evidence.billSearch = billSearch;
 
-    if (!isInfluencePersonQuery && !isCommitteeStatsQuery) {
+    if (!isInfluencePersonQuery && !isCommitteeStatsQuery && !isAgencyRuleQuery) {
       const total = Number(billSearch.totalMatches || 0);
       const totalInScope = Number(billSearch.totalBillsInScope || 0);
       const bySession = (billSearch.bySession as Array<Record<string, unknown>>) || [];
@@ -2267,11 +2544,13 @@ function runDeterministicPlan(
       const headingSubject =
         disposition
           ? `Disposition: "${disposition}"`
-          : isBipartisanQuery
-            ? 'High Influence & High Bipartisan Index Bills'
-            : topic
-              ? `"${topic}"`
-              : 'Matching Legislation';
+          : isCostQuery
+            ? 'Highest LBB Fiscal Impact Bills'
+            : isBipartisanQuery
+              ? 'High Influence & High Bipartisan Index Bills'
+              : topic
+                ? `"${topic}"`
+                : 'Matching Legislation';
 
       lines.push(`### ${headingSubject} (${session || 'All Sessions'})`);
       lines.push(
@@ -2292,8 +2571,13 @@ function runDeterministicPlan(
         }
         lines.push('\n**Matching Bills:**');
         for (const b of bills.slice(0, 10)) {
+          const fiscalTag = b.biennialGrFormatted && b.biennialGrFormatted !== '—'
+            ? ` · LBB 2-Yr GR **${b.biennialGrFormatted}**`
+            : b.fiscalStatus
+              ? ` · LBB: ${b.fiscalStatus}`
+              : '';
           lines.push(
-            `- **${b.session} ${b.billNumber}** (${b.outcomeDetail} · Influence **${b.influenceScore}** · Bipartisan **${b.bipartisanIndex}**) — ${b.title} *(Author: ${b.primaryAuthor})*`
+            `- **${b.session} ${b.billNumber}** (${b.outcomeDetail}${fiscalTag} · Influence **${b.influenceScore}** · Bipartisan **${b.bipartisanIndex}**) — ${b.title} *(Author: ${b.primaryAuthor})*`
           );
         }
       } else {
@@ -2354,15 +2638,17 @@ STRICT ACCURACY & GROUNDING RULES:
 4. For committee passage rates, bottlenecks, or referrals, ALWAYS call get_committee_stats — never estimate or fabricate committee rates from keyword trends. Leave includeProcedural=false unless the user specifically asks about Calendars or procedural committees.
 5. For session-specific counts, ALWAYS cite totalBillsInScope for that session (NEVER confuse totalBillsAllSessions with a single session's count!).
 6. Note that 90R is the upcoming/active 90th Legislature; bills in 90R are "Active" and have not died at sine die.
-7. Present crisp, structured answers using concise markdown headings and bullet points with exact numbers, bill numbers, influence/bipartisan metrics when relevant, and legislator names.`;
+7. For bill cost, LBB fiscal notes, or state budget impact questions, use search_and_count_bills(sortBy="cost") or get_bill_details and report exact LBB 2-Year General Revenue, All Funds, and FTE figures (negative dollar figures represent net cost/outlay to General Revenue).
+8. For Texas state agency rule changes, Texas Register weekly notices, TAC citations, or rules implementing a specific bill, call search_agency_rules.
+9. Present crisp, structured answers using concise markdown headings and bullet points with exact numbers, bill numbers, fiscal impacts, TAC citations, and legislator names.`;
 
 const SYNTHESIS_SYSTEM_PROMPT = `You are a Texas legislative research analyst. You are given verified JSON evidence from direct SQLite database queries.
 
 STRICT RULES:
-1. Answer ONLY using the provided JSON evidence. Do NOT fabricate numbers, passage rates, bill numbers, or legislator names.
+1. Answer ONLY using the provided JSON evidence. Do NOT fabricate numbers, passage rates, fiscal dollar amounts, TAC citations, bill numbers, or legislator names.
 2. Verify ALL criteria requested by the user (for example, if the user asked for bills with BOTH high influence score AND high bipartisan index, explicitly cite both influenceScore and bipartisanIndex for each bill and ONLY include bills that meet BOTH criteria — never substitute one criterion for another).
 3. Respect the exact session scope in the JSON: if scope is "ALL SESSIONS", state findings across all sessions (broken down by session when available) and NEVER claim the results are only from 89R. If a specific session was queried, cite totalBillsInScope for that session (NOT totalBillsAllSessions).
-4. Present concise, factual markdown with exact figures, bill numbers, and legislator names.`;
+4. Present concise, factual markdown with exact figures, bill numbers, LBB fiscal impacts, TAC citations, and legislator names.`;
 
 export async function runResearchAgent(input: {
   question: string;

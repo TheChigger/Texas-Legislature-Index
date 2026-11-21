@@ -24,7 +24,7 @@ const SHORTCUT_GROUPS: Array<{
   {
     heading: 'Navigation & Triage',
     items: [
-      { keys: ['1', '–', '9'], description: 'Switch views (Legislation, Research Desk, Timeline, Politicians, Receptivity, Network, Amendments, Statutes, Alerts)' },
+      { keys: ['1', '–', '0'], description: 'Switch views (Legislation, Research Desk, Timeline, Politicians, Receptivity, Network, Amendments, Statutes, Agency Rules, Alerts)' },
       { keys: ['j', 'k'], description: 'Select next / previous record in active index list' },
       { keys: ['?'], description: 'Toggle this keyboard shortcuts reference' },
       { keys: ['Esc'], description: 'Close open modal or unfocus search input' },

@@ -45,6 +45,14 @@ const EXAMPLE_QUESTIONS: Array<{ label: string; question: string }> = [
     label: 'Property Tax Enactments',
     question: 'What property tax bills passed across 88R and 891?',
   },
+  {
+    label: 'Most Expensive 89R Bills',
+    question: 'What are the most expensive bills passed in 89R according to LBB fiscal notes?',
+  },
+  {
+    label: 'HB 2 Agency Rules',
+    question: 'Which Texas Register agency rule changes implement HB 2?',
+  },
 ];
 
 function renderInlineMarkdown(text: string): React.ReactNode[] {
