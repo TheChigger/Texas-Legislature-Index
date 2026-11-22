@@ -201,6 +201,7 @@ export const PlatformsView: React.FC<PlatformsViewProps> = ({
     const params = new URLSearchParams();
     params.set('mode', wfMode);
     params.set('domain', wfDomain);
+    if (activeSession) params.set('session', activeSession);
     fetch(`/api/platforms/wordfish?${params.toString()}`)
       .then((r) => r.json())
       .then((data: WordfishResult) => {
@@ -218,7 +219,7 @@ export const PlatformsView: React.FC<PlatformsViewProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [tab, wfMode, wfDomain, refreshSignal, overview?.platforms.length]);
+  }, [tab, wfMode, wfDomain, activeSession, refreshSignal, overview?.platforms.length]);
 
   // Fetch Planks when on Plank Explorer tab
   useEffect(() => {

@@ -47,6 +47,7 @@ import {
   MARPOR_RILE_CODEBOOK,
   recomputeAllEntityScalingScores,
   runWordfishScaling,
+  scoreSessionBills,
   scoreTextWithWordscores,
   syncOfficial2026Platforms,
   TEXAS_DOMAIN_NAMES,
@@ -3868,6 +3869,21 @@ apiRouter.get('/platforms/wordscores', (req, res) => {
 
   if (entityType === 'bill') {
     if (session) {
+      // If this session has bills in the DB but 0 scored rows yet (e.g., freshly synced 90R),
+      // score them automatically so the user never hits an empty Wordscores table.
+      const existingScoredForSession = (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS c
+             FROM entity_scaling_scores s
+             JOIN bills b ON b.id = s.entity_id
+             WHERE s.entity_type = 'bill' AND b.session = ?`
+          )
+          .get(session) as { c: number }
+      ).c;
+      if (existingScoredForSession === 0) {
+        scoreSessionBills(session, { onlyMissing: true, limit: 6000 });
+      }
       conds.push('b.session = ?');
       params.push(session);
     }
@@ -4006,7 +4022,8 @@ apiRouter.get('/platforms/wordfish', (req, res) => {
       ? 'historical_platforms'
       : 'topic_corpus';
   const domain = String(req.query.domain ?? 'All Indexed Policy Domains').trim();
-  const result = runWordfishScaling({ mode, domain });
+  const session = String(req.query.session ?? '').trim() || undefined;
+  const result = runWordfishScaling({ mode, domain, session });
   res.json(result);
 });
 

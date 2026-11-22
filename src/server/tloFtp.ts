@@ -14,6 +14,7 @@ import {
 import { decodeHtmlEntities, htmlToCleanPlainText } from './textClean.ts';
 import { recomputeBillFiscalImpact } from './fiscalParser.ts';
 import { relinkAllRulesToBills } from './texasRegister.ts';
+import { scoreSessionBills } from './partyPlatforms.ts';
 import type { BillStage, Chamber } from '../types.ts';
 
 export type TloBillType =
@@ -1196,6 +1197,11 @@ async function runConcurrentTloSync(params: CoreIngestParams): Promise<TloSyncRe
     backfillPoliticiansFromBills();
     refreshSessionCounts();
     relinkAllRulesToBills();
+    try {
+      scoreSessionBills(session, { onlyMissing: false, limit: 6000 });
+    } catch (err) {
+      console.error(`Post-sync Wordscores update skipped for ${session}:`, err);
+    }
     finalAlerts = evaluateAlertRules();
     if (job) {
       job.alertsTriggered += finalAlerts;

@@ -1222,6 +1222,7 @@ export function rebuildWordscoresVocabulary(): {
   repRawAnchor: number;
 } {
   cachedVocab = null;
+  cachedPlankIndex = null;
 
   const demPlatform = db
     .prepare(
@@ -1460,10 +1461,17 @@ interface IndexedPlankEntry {
   norm: number;
 }
 
-function buildPlankTfIdfIndex(): {
+interface PlankTfIdfIndex {
   entries: IndexedPlankEntry[];
   idf: Map<string, number>;
-} {
+}
+
+let cachedPlankIndex: PlankTfIdfIndex | null = null;
+
+function buildPlankTfIdfIndex(forceRebuild = false): PlankTfIdfIndex {
+  if (!forceRebuild && cachedPlankIndex && cachedPlankIndex.entries.length > 0) {
+    return cachedPlankIndex;
+  }
   const rows = db
     .prepare(
       `SELECT id, platform_id, party, year, chapter, plank_number, heading, body, rile_code, texas_domain
@@ -1530,7 +1538,8 @@ function buildPlankTfIdfIndex(): {
     };
   });
 
-  return { entries, idf };
+  cachedPlankIndex = { entries, idf };
+  return cachedPlankIndex;
 }
 
 function findTopMatchedPlanksForText(
@@ -1599,53 +1608,45 @@ function findTopMatchedPlanksForText(
   return [...demMatches.slice(0, perParty), ...repMatches.slice(0, perParty)];
 }
 
-export function recomputeAllEntityScalingScores(): {
-  billsScored: number;
-  rulesScored: number;
-} {
-  const vocab = rebuildWordscoresVocabulary();
-  if (vocab.vocabSize === 0) {
-    return { billsScored: 0, rulesScored: 0 };
+interface BillForScoringRow {
+  id: string;
+  title: string;
+  summary: string;
+  subjects_json: string;
+  full_text: string;
+  analysis_text: string | null;
+}
+
+interface RuleForScoringRow {
+  id: string;
+  agency_name: string;
+  title: string;
+  summary: string;
+  statutory_authority: string;
+  fiscal_note_text: string;
+  full_text: string;
+}
+
+function buildBillCombinedText(b: BillForScoringRow): { scoringText: string; plankText: string } {
+  let subjects = '';
+  try {
+    subjects = (JSON.parse(b.subjects_json || '[]') as string[]).join(' ');
+  } catch {
+    subjects = '';
   }
+  const summaryPart = b.summary && b.summary !== 'TLO FTP Record' ? b.summary : '';
+  return {
+    scoringText: `${b.title} ${b.title} ${summaryPart} ${subjects} ${b.analysis_text || ''} ${(b.full_text || '').slice(0, 4500)}`,
+    plankText: `${b.title} ${summaryPart} ${subjects} ${(b.analysis_text || '').slice(0, 1200)} ${(b.full_text || '').slice(0, 1600)}`,
+  };
+}
 
-  const plankIndex = buildPlankTfIdfIndex();
-  const now = new Date().toISOString();
-
-  // Score bills (prefer title + summary + subjects + bill analyses + full_text excerpt)
-  const billRows = db
-    .prepare(
-      `SELECT b.id, b.title, b.summary, b.subjects_json, b.full_text,
-              (SELECT GROUP_CONCAT(d.summary || ' ' || substr(d.full_text, 1, 1800), ' ')
-               FROM bill_documents d WHERE d.bill_id = b.id AND d.doc_type = 'analysis') AS analysis_text
-       FROM bills b
-       ORDER BY b.influence_score DESC
-       LIMIT 3500`
-    )
-    .all() as Array<{
-    id: string;
-    title: string;
-    summary: string;
-    subjects_json: string;
-    full_text: string;
-    analysis_text: string | null;
-  }>;
-
-  const ruleRows = db
-    .prepare(
-      `SELECT id, agency_name, title, summary, statutory_authority, fiscal_note_text, full_text
-       FROM agency_rules
-       ORDER BY issue_date DESC
-       LIMIT 1000`
-    )
-    .all() as Array<{
-    id: string;
-    agency_name: string;
-    title: string;
-    summary: string;
-    statutory_authority: string;
-    fiscal_note_text: string;
-    full_text: string;
-  }>;
+function scoreAndStoreBillRows(
+  billRows: BillForScoringRow[],
+  plankIndex: PlankTfIdfIndex,
+  now: string
+): number {
+  if (billRows.length === 0) return 0;
 
   const upsert = db.prepare(
     `INSERT OR REPLACE INTO entity_scaling_scores (
@@ -1655,26 +1656,13 @@ export function recomputeAllEntityScalingScores(): {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
 
-  let billsScored = 0;
-  let rulesScored = 0;
-
+  let scored = 0;
   const tx = db.transaction(() => {
     for (const b of billRows) {
-      let subjects = '';
-      try {
-        subjects = (JSON.parse(b.subjects_json || '[]') as string[]).join(' ');
-      } catch {
-        subjects = '';
-      }
-      const summaryPart = b.summary && b.summary !== 'TLO FTP Record' ? b.summary : '';
-      const combined = `${b.title} ${b.title} ${summaryPart} ${subjects} ${b.analysis_text || ''} ${(b.full_text || '').slice(0, 4500)}`;
-      const ws = scoreTextWithWordscores(combined);
+      const { scoringText, plankText } = buildBillCombinedText(b);
+      const ws = scoreTextWithWordscores(scoringText);
       if (!ws) continue;
-      const matchedPlanks = findTopMatchedPlanksForText(
-        `${b.title} ${summaryPart} ${subjects} ${(b.analysis_text || '').slice(0, 1200)} ${(b.full_text || '').slice(0, 1600)}`,
-        plankIndex,
-        2
-      );
+      const matchedPlanks = findTopMatchedPlanksForText(plankText, plankIndex, 2);
       upsert.run(
         'bill',
         b.id,
@@ -1690,9 +1678,133 @@ export function recomputeAllEntityScalingScores(): {
         JSON.stringify(matchedPlanks),
         now
       );
-      billsScored++;
+      scored++;
     }
+  });
+  tx();
+  return scored;
+}
 
+export function scoreSessionBills(
+  session: string,
+  opts?: { onlyMissing?: boolean; limit?: number }
+): number {
+  const cache = getWordscoresVocabCache();
+  if (!cache || cache.scores.size === 0) return 0;
+
+  const cleanSession = session.trim();
+  if (!cleanSession) return 0;
+
+  const limit = Math.min(Math.max(opts?.limit ?? 6000, 1), 12000);
+  const onlyMissing = opts?.onlyMissing === true;
+
+  const billRows = db
+    .prepare(
+      `SELECT b.id, b.title, b.summary, b.subjects_json, b.full_text,
+              (SELECT GROUP_CONCAT(d.summary || ' ' || substr(d.full_text, 1, 1800), ' ')
+               FROM bill_documents d WHERE d.bill_id = b.id AND d.doc_type = 'analysis') AS analysis_text
+       FROM bills b
+       ${onlyMissing ? `LEFT JOIN entity_scaling_scores s ON s.entity_type = 'bill' AND s.entity_id = b.id` : ''}
+       WHERE b.session = ?
+       ${onlyMissing ? `AND s.entity_id IS NULL` : ''}
+       ORDER BY b.influence_score DESC, b.last_action_date DESC, b.id ASC
+       LIMIT ?`
+    )
+    .all(cleanSession, limit) as BillForScoringRow[];
+
+  if (billRows.length === 0) return 0;
+
+  const plankIndex = buildPlankTfIdfIndex();
+  return scoreAndStoreBillRows(billRows, plankIndex, new Date().toISOString());
+}
+
+export function backfillUnscoredSessions(): number {
+  const cache = getWordscoresVocabCache();
+  if (!cache || cache.scores.size === 0) return 0;
+
+  // Find every session that has bills in `bills` but 0 rows in `entity_scaling_scores`
+  const missingSessions = db
+    .prepare(
+      `SELECT b.session
+       FROM bills b
+       LEFT JOIN entity_scaling_scores s ON s.entity_type = 'bill' AND s.entity_id = b.id
+       GROUP BY b.session
+       HAVING COUNT(s.entity_id) = 0
+       ORDER BY CAST(SUBSTR(b.session, 1, 2) AS INTEGER) DESC, b.session DESC`
+    )
+    .all() as Array<{ session: string }>;
+
+  if (missingSessions.length === 0) return 0;
+
+  let totalScored = 0;
+  for (let i = 0; i < missingSessions.length; i++) {
+    const sess = missingSessions[i].session;
+    const budget = i === 0 || /^9\d/.test(sess) ? 6000 : 2000;
+    totalScored += scoreSessionBills(sess, { onlyMissing: true, limit: budget });
+  }
+  return totalScored;
+}
+
+export function recomputeAllEntityScalingScores(): {
+  billsScored: number;
+  rulesScored: number;
+} {
+  const vocab = rebuildWordscoresVocabulary();
+  if (vocab.vocabSize === 0) {
+    return { billsScored: 0, rulesScored: 0 };
+  }
+
+  const plankIndex = buildPlankTfIdfIndex(true);
+  const now = new Date().toISOString();
+
+  // Score bills per session (newest sessions first, e.g., 90R gets up to 6,000 bills so
+  // newly pre-filed sessions are never starved out by higher-influence prior sessions).
+  const sessions = db
+    .prepare(
+      `SELECT DISTINCT session
+       FROM bills
+       WHERE session IS NOT NULL AND session != ''
+       ORDER BY CAST(SUBSTR(session, 1, 2) AS INTEGER) DESC, session DESC`
+    )
+    .all() as Array<{ session: string }>;
+
+  const selectSessionBillsStmt = db.prepare(
+    `SELECT b.id, b.title, b.summary, b.subjects_json, b.full_text,
+            (SELECT GROUP_CONCAT(d.summary || ' ' || substr(d.full_text, 1, 1800), ' ')
+             FROM bill_documents d WHERE d.bill_id = b.id AND d.doc_type = 'analysis') AS analysis_text
+     FROM bills b
+     WHERE b.session = ?
+     ORDER BY b.influence_score DESC, b.last_action_date DESC, b.id ASC
+     LIMIT ?`
+  );
+
+  let billsScored = 0;
+  for (let idx = 0; idx < sessions.length; idx++) {
+    const sess = sessions[idx].session;
+    const perSessionLimit = idx === 0 || /^9\d/.test(sess) ? 6000 : 2000;
+    const billRows = selectSessionBillsStmt.all(sess, perSessionLimit) as BillForScoringRow[];
+    billsScored += scoreAndStoreBillRows(billRows, plankIndex, now);
+  }
+
+  const ruleRows = db
+    .prepare(
+      `SELECT id, agency_name, title, summary, statutory_authority, fiscal_note_text, full_text
+       FROM agency_rules
+       ORDER BY issue_date DESC
+       LIMIT 1500`
+    )
+    .all() as RuleForScoringRow[];
+
+  const upsert = db.prepare(
+    `INSERT OR REPLACE INTO entity_scaling_scores (
+      entity_type, entity_id, raw_wordscore, transformed_wordscore, standard_error,
+      matched_tokens, total_tokens, overlap_pct, confidence_tier,
+      top_dem_terms_json, top_rep_terms_json, matched_planks_json, computed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+
+  let rulesScored = 0;
+  const txRules = db.transaction(() => {
     for (const r of ruleRows) {
       const combined = `${r.title} ${r.agency_name} ${r.summary} ${r.fiscal_note_text} ${(r.full_text || '').slice(0, 4000)}`;
       const ws = scoreTextWithWordscores(combined);
@@ -1721,7 +1833,7 @@ export function recomputeAllEntityScalingScores(): {
     }
   });
 
-  tx();
+  txRules();
   return { billsScored, rulesScored };
 }
 
@@ -1751,22 +1863,142 @@ export function getEntityPlatformAlignment(
       }
     | undefined;
 
-  if (!row) return null;
+  if (row) {
+    return {
+      entityType: row.entity_type,
+      entityId: row.entity_id,
+      rawWordscore: Number(row.raw_wordscore),
+      transformedWordscore: Number(row.transformed_wordscore),
+      standardError: Number(row.standard_error),
+      matchedTokens: Number(row.matched_tokens),
+      totalTokens: Number(row.total_tokens),
+      overlapPct: Number(row.overlap_pct),
+      confidenceTier: row.confidence_tier,
+      topDemTerms: JSON.parse(row.top_dem_terms_json || '[]'),
+      topRepTerms: JSON.parse(row.top_rep_terms_json || '[]'),
+      matchedPlanks: JSON.parse(row.matched_planks_json || '[]'),
+      computedAt: row.computed_at,
+    };
+  }
+
+  // On-demand fallback: if platforms are indexed but this bill/rule wasn't in the precomputed batch,
+  // compute its Wordscore + matched planks on the fly and cache it in entity_scaling_scores.
+  const cache = getWordscoresVocabCache();
+  if (!cache || cache.scores.size === 0) return null;
+
+  const now = new Date().toISOString();
+  const plankIndex = buildPlankTfIdfIndex();
+
+  if (entityType === 'bill') {
+    const bill = db
+      .prepare(
+        `SELECT b.id, b.title, b.summary, b.subjects_json, b.full_text,
+                (SELECT GROUP_CONCAT(d.summary || ' ' || substr(d.full_text, 1, 1800), ' ')
+                 FROM bill_documents d WHERE d.bill_id = b.id AND d.doc_type = 'analysis') AS analysis_text
+         FROM bills b
+         WHERE b.id = ?`
+      )
+      .get(entityId) as BillForScoringRow | undefined;
+    if (!bill) return null;
+
+    const { scoringText, plankText } = buildBillCombinedText(bill);
+    const ws = scoreTextWithWordscores(scoringText);
+    if (!ws) return null;
+    const matchedPlanks = findTopMatchedPlanksForText(plankText, plankIndex, 2);
+
+    db.prepare(
+      `INSERT OR REPLACE INTO entity_scaling_scores (
+        entity_type, entity_id, raw_wordscore, transformed_wordscore, standard_error,
+        matched_tokens, total_tokens, overlap_pct, confidence_tier,
+        top_dem_terms_json, top_rep_terms_json, matched_planks_json, computed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'bill',
+      bill.id,
+      ws.rawWordscore,
+      ws.transformedWordscore,
+      ws.standardError,
+      ws.matchedTokens,
+      ws.totalTokens,
+      ws.overlapPct,
+      ws.confidenceTier,
+      JSON.stringify(ws.topDemTerms),
+      JSON.stringify(ws.topRepTerms),
+      JSON.stringify(matchedPlanks),
+      now
+    );
+
+    return {
+      entityType: 'bill',
+      entityId: bill.id,
+      rawWordscore: ws.rawWordscore,
+      transformedWordscore: ws.transformedWordscore,
+      standardError: ws.standardError,
+      matchedTokens: ws.matchedTokens,
+      totalTokens: ws.totalTokens,
+      overlapPct: ws.overlapPct,
+      confidenceTier: ws.confidenceTier,
+      topDemTerms: ws.topDemTerms,
+      topRepTerms: ws.topRepTerms,
+      matchedPlanks,
+      computedAt: now,
+    };
+  }
+
+  const rule = db
+    .prepare(
+      `SELECT id, agency_name, title, summary, statutory_authority, fiscal_note_text, full_text
+       FROM agency_rules
+       WHERE id = ?`
+    )
+    .get(entityId) as RuleForScoringRow | undefined;
+  if (!rule) return null;
+
+  const combined = `${rule.title} ${rule.agency_name} ${rule.summary} ${rule.fiscal_note_text} ${(rule.full_text || '').slice(0, 4000)}`;
+  const ws = scoreTextWithWordscores(combined);
+  if (!ws) return null;
+  const matchedPlanks = findTopMatchedPlanksForText(
+    `${rule.title} ${rule.summary} ${(rule.full_text || '').slice(0, 1400)}`,
+    plankIndex,
+    2
+  );
+
+  db.prepare(
+    `INSERT OR REPLACE INTO entity_scaling_scores (
+      entity_type, entity_id, raw_wordscore, transformed_wordscore, standard_error,
+      matched_tokens, total_tokens, overlap_pct, confidence_tier,
+      top_dem_terms_json, top_rep_terms_json, matched_planks_json, computed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    'rule',
+    rule.id,
+    ws.rawWordscore,
+    ws.transformedWordscore,
+    ws.standardError,
+    ws.matchedTokens,
+    ws.totalTokens,
+    ws.overlapPct,
+    ws.confidenceTier,
+    JSON.stringify(ws.topDemTerms),
+    JSON.stringify(ws.topRepTerms),
+    JSON.stringify(matchedPlanks),
+    now
+  );
 
   return {
-    entityType: row.entity_type,
-    entityId: row.entity_id,
-    rawWordscore: Number(row.raw_wordscore),
-    transformedWordscore: Number(row.transformed_wordscore),
-    standardError: Number(row.standard_error),
-    matchedTokens: Number(row.matched_tokens),
-    totalTokens: Number(row.total_tokens),
-    overlapPct: Number(row.overlap_pct),
-    confidenceTier: row.confidence_tier,
-    topDemTerms: JSON.parse(row.top_dem_terms_json || '[]'),
-    topRepTerms: JSON.parse(row.top_rep_terms_json || '[]'),
-    matchedPlanks: JSON.parse(row.matched_planks_json || '[]'),
-    computedAt: row.computed_at,
+    entityType: 'rule',
+    entityId: rule.id,
+    rawWordscore: ws.rawWordscore,
+    transformedWordscore: ws.transformedWordscore,
+    standardError: ws.standardError,
+    matchedTokens: ws.matchedTokens,
+    totalTokens: ws.totalTokens,
+    overlapPct: ws.overlapPct,
+    confidenceTier: ws.confidenceTier,
+    topDemTerms: ws.topDemTerms,
+    topRepTerms: ws.topRepTerms,
+    matchedPlanks,
+    computedAt: now,
   };
 }
 
@@ -2106,6 +2338,7 @@ function fitWordfishPoissonModel(
 export function runWordfishScaling(opts: {
   mode: 'topic_corpus' | 'historical_platforms';
   domain?: string;
+  session?: string;
 }): WordfishResult {
   if (opts.mode === 'historical_platforms') {
     const platforms = db
@@ -2183,17 +2416,44 @@ export function runWordfishScaling(opts: {
     return fitWordfishPoissonModel(docs, 'topic_corpus', 'All Platform Policy Chapters (2026)');
   }
 
-  // Specific Texas policy domain: matching bills + domain chapters from both parties
-  const billRows = db
-    .prepare(
-      `SELECT b.id, b.session, b.bill_number, b.title, b.summary, b.subjects_json, b.primary_author, b.stage, b.full_text,
-              (SELECT GROUP_CONCAT(d.summary || ' ' || substr(d.full_text, 1, 1500), ' ')
-               FROM bill_documents d WHERE d.bill_id = b.id AND d.doc_type = 'analysis') AS analysis_text
-       FROM bills b
-       ORDER BY b.influence_score DESC
-       LIMIT 200`
-    )
-    .all() as Array<{
+  // Specific Texas policy domain: matching bills + domain chapters from both parties.
+  // If a session filter is active (e.g. 90R), sample from that session; otherwise sample evenly
+  // across every session (newest first) so 90R pre-filed bills are represented alongside 89R/88R.
+  const sessionFilter = (opts.session || '').trim();
+  const billRows = (
+    sessionFilter
+      ? db
+          .prepare(
+            `SELECT b.id, b.session, b.bill_number, b.title, b.summary, b.subjects_json, b.primary_author, b.stage, b.full_text,
+                    (SELECT GROUP_CONCAT(d.summary || ' ' || substr(d.full_text, 1, 1500), ' ')
+                     FROM bill_documents d WHERE d.bill_id = b.id AND d.doc_type = 'analysis') AS analysis_text
+             FROM bills b
+             WHERE b.session = ?
+             ORDER BY b.influence_score DESC, b.last_action_date DESC
+             LIMIT 250`
+          )
+          .all(sessionFilter)
+      : db
+          .prepare(
+            `WITH ranked AS (
+               SELECT b.id, b.session, b.bill_number, b.title, b.summary, b.subjects_json, b.primary_author, b.stage, b.full_text,
+                      b.influence_score, b.last_action_date,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY b.session
+                        ORDER BY b.influence_score DESC, b.last_action_date DESC
+                      ) AS rn
+               FROM bills b
+             )
+             SELECT r.id, r.session, r.bill_number, r.title, r.summary, r.subjects_json, r.primary_author, r.stage, r.full_text,
+                    (SELECT GROUP_CONCAT(d.summary || ' ' || substr(d.full_text, 1, 1500), ' ')
+                     FROM bill_documents d WHERE d.bill_id = r.id AND d.doc_type = 'analysis') AS analysis_text
+             FROM ranked r
+             WHERE r.rn <= 75
+             ORDER BY CAST(SUBSTR(r.session, 1, 2) AS INTEGER) DESC, r.rn ASC
+             LIMIT 300`
+          )
+          .all()
+  ) as Array<{
     id: string;
     session: string;
     bill_number: string;
@@ -2345,16 +2605,29 @@ export function ensurePlatformsBootSynced(): void {
     db.prepare(`SELECT COUNT(*) AS c FROM party_platforms`).get() as { c: number }
   ).c;
   if (count >= 2) {
-    // Ensure entity scores exist if bills/rules were added
+    // Ensure entity scores exist, and backfill any session (e.g., newly synced 90R) with 0 scored bills
     const scoredCount = (
       db.prepare(`SELECT COUNT(*) AS c FROM entity_scaling_scores`).get() as { c: number }
     ).c;
     if (scoredCount === 0) {
-      try {
-        recomputeAllEntityScalingScores();
-      } catch (err) {
-        console.error('Platform score backfill skipped:', err);
-      }
+      setImmediate(() => {
+        try {
+          recomputeAllEntityScalingScores();
+        } catch (err) {
+          console.error('Platform score backfill skipped:', err);
+        }
+      });
+    } else {
+      setImmediate(() => {
+        try {
+          const added = backfillUnscoredSessions();
+          if (added > 0) {
+            console.log(`Backfilled Wordscores for ${added} bills across previously unscored sessions`);
+          }
+        } catch (err) {
+          console.error('Unscored session backfill skipped:', err);
+        }
+      });
     }
     return;
   }
