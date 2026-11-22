@@ -100,18 +100,67 @@ export const RedlineDiffPane: React.FC<RedlineDiffPaneProps> = ({
       </div>
 
       {diff && (
-        <div className="px-4 py-2 border-b border-[#DFD9CE] bg-[#FBF9F5] flex items-center justify-between text-xs font-mono tabular-nums text-[#57534E]">
-          <span>
-            {diff.fromVersion.label} → {diff.toVersion.label}
-          </span>
-          <div className="flex items-center gap-4">
-            <span className="inline-flex items-center gap-1 text-[#14532D] font-medium">
-              <Plus className="w-3 h-3" /> {diff.addedCount} added
+        <div className="px-4 py-2 border-b border-[#DFD9CE] bg-[#FBF9F5] space-y-1.5 text-xs font-mono tabular-nums text-[#57534E]">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span>
+              {diff.fromVersion.label} → {diff.toVersion.label}
             </span>
-            <span className="inline-flex items-center gap-1 text-[#991B1B] font-medium">
-              <Minus className="w-3 h-3" /> {diff.removedCount} removed
-            </span>
+            <div className="flex items-center gap-4">
+              <span className="inline-flex items-center gap-1 text-[#14532D] font-medium">
+                <Plus className="w-3 h-3" /> {diff.addedCount} added
+              </span>
+              <span className="inline-flex items-center gap-1 text-[#991B1B] font-medium">
+                <Minus className="w-3 h-3" /> {diff.removedCount} removed
+              </span>
+            </div>
           </div>
+          {diff.wordscoresShift && (
+            <div className="pt-1.5 border-t border-[#EAE4D9] flex flex-wrap items-center justify-between gap-2 text-[11px]">
+              <span>
+                Wordscores Shift:{' '}
+                <strong className="text-[#181715]">
+                  {diff.wordscoresShift.fromScore > 0 ? '+' : ''}
+                  {diff.wordscoresShift.fromScore.toFixed(2)} →{' '}
+                  {diff.wordscoresShift.toScore > 0 ? '+' : ''}
+                  {diff.wordscoresShift.toScore.toFixed(2)}
+                </strong>{' '}
+                (
+                <span
+                  className={
+                    diff.wordscoresShift.delta < -0.04
+                      ? 'text-[#1E3A5F] font-semibold'
+                      : diff.wordscoresShift.delta > 0.04
+                        ? 'text-[#991B1B] font-semibold'
+                        : 'text-[#57534E]'
+                  }
+                >
+                  Δ {diff.wordscoresShift.delta > 0 ? '+' : ''}
+                  {diff.wordscoresShift.delta.toFixed(2)}
+                </span>
+                {' · '}
+                {diff.wordscoresShift.confidenceTier} overlap)
+              </span>
+              {(diff.wordscoresShift.addedTermsDem.length > 0 ||
+                diff.wordscoresShift.addedTermsRep.length > 0) && (
+                <span className="text-[#78716C] truncate max-w-md">
+                  Added terms:{' '}
+                  {diff.wordscoresShift.addedTermsDem.length > 0 && (
+                    <span className="text-[#1E3A5F]">
+                      D[{diff.wordscoresShift.addedTermsDem.map((t) => t.term).join(', ')}]
+                    </span>
+                  )}
+                  {diff.wordscoresShift.addedTermsDem.length > 0 &&
+                    diff.wordscoresShift.addedTermsRep.length > 0 &&
+                    ' · '}
+                  {diff.wordscoresShift.addedTermsRep.length > 0 && (
+                    <span className="text-[#991B1B]">
+                      R[{diff.wordscoresShift.addedTermsRep.map((t) => t.term).join(', ')}]
+                    </span>
+                  )}
+                </span>
+              )}
+            </div>
+          )}
         </div>
       )}
 

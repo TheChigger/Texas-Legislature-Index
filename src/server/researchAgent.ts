@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { db, isProceduralCommittee } from './db.ts';
 import { formatFiscalDollars } from './fiscalParser.ts';
+import { getEntityPlatformAlignment, listPartyPlatforms } from './partyPlatforms.ts';
 import type {
   BillOutcome,
   Chamber,
@@ -1755,6 +1756,8 @@ function toolGetBillDetails(
     )
     .all(row.id);
 
+  const platformAlignment = getEntityPlatformAlignment('bill', row.id);
+
   return {
     payload: {
       found: true,
@@ -1783,6 +1786,24 @@ function toolGetBillDetails(
           versionLabel: safeStr(row.fiscal_note_version),
           summary: safeStr(row.fiscal_summary),
         },
+        platformAlignment: platformAlignment
+          ? {
+              transformedWordscore: platformAlignment.transformedWordscore,
+              rawWordscore: platformAlignment.rawWordscore,
+              standardError: platformAlignment.standardError,
+              overlapPct: platformAlignment.overlapPct,
+              confidenceTier: platformAlignment.confidenceTier,
+              topDemTerms: platformAlignment.topDemTerms.slice(0, 4).map((t) => t.term),
+              topRepTerms: platformAlignment.topRepTerms.slice(0, 4).map((t) => t.term),
+              matchedPlanks: platformAlignment.matchedPlanks.map((p) => ({
+                party: p.party,
+                year: p.year,
+                plankNumber: p.plankNumber,
+                heading: p.heading,
+                chapter: p.chapter,
+              })),
+            }
+          : null,
       },
       amendments,
       witnessSummary,
@@ -1986,6 +2007,148 @@ function toolSearchStatutes(
   };
 }
 
+function toolSearchPartyPlatforms(
+  args: { query?: string; party?: string; domain?: string; limit?: number },
+  ctx: AgentExecutionContext
+): { payload: Record<string, unknown>; summary: string; resultCount: number } {
+  const q = safeStr(args.query).trim();
+  const party = safeStr(args.party).trim();
+  const domain = safeStr(args.domain).trim();
+  const limit = Math.min(16, Math.max(2, Number(args.limit) || 10));
+
+  const platforms = listPartyPlatforms().map((p) => ({
+    id: p.id,
+    party: p.party,
+    year: p.year,
+    title: p.title,
+    wordCount: p.wordCount,
+    plankCount: p.plankCount,
+    rileScore: p.rileScore,
+    rileLogit: p.rileLogit,
+    rileRightCount: p.rileRightCount,
+    rileLeftCount: p.rileLeftCount,
+    topDomains: p.domainSalience.slice(0, 5),
+  }));
+
+  const conds: string[] = [];
+  const params: Array<string | number> = [];
+  if (party && ['Democratic', 'Republican', 'Other'].includes(party)) {
+    conds.push('p.party = ?');
+    params.push(party);
+  }
+  if (domain) {
+    conds.push('LOWER(p.texas_domain) LIKE LOWER(?)');
+    params.push(`%${domain}%`);
+  }
+
+  interface PlankRow {
+    id: string;
+    party: string;
+    year: number;
+    chapter: string;
+    plank_number: string;
+    heading: string;
+    body: string;
+    rile_code: string;
+    rile_label: string;
+    rile_direction: string;
+    texas_domain: string;
+  }
+
+  let planks: PlankRow[] = [];
+  if (q) {
+    const fts = buildFtsFromNaturalText(q, false);
+    if (fts) {
+      try {
+        planks = db
+          .prepare(
+            `SELECT p.* FROM planks_fts
+             JOIN platform_planks p ON p.id = planks_fts.plank_id
+             WHERE planks_fts MATCH ? ${conds.length ? 'AND ' + conds.join(' AND ') : ''}
+             ORDER BY bm25(planks_fts) ASC
+             LIMIT ?`
+          )
+          .all(fts, ...params, limit) as PlankRow[];
+      } catch {
+        planks = [];
+      }
+    }
+    if (planks.length === 0) {
+      const pat = `%${q}%`;
+      const likeConds = [...conds, '(LOWER(p.heading) LIKE LOWER(?) OR LOWER(p.body) LIKE LOWER(?))'];
+      planks = db
+        .prepare(
+          `SELECT p.* FROM platform_planks p WHERE ${likeConds.join(' AND ')} ORDER BY p.year DESC LIMIT ?`
+        )
+        .all(...params, pat, pat, limit) as PlankRow[];
+    }
+  } else {
+    planks = db
+      .prepare(
+        `SELECT p.* FROM platform_planks p ${conds.length ? 'WHERE ' + conds.join(' AND ') : ''} ORDER BY p.year DESC, p.party ASC, p.sort_order ASC LIMIT ?`
+      )
+      .all(...params, limit) as PlankRow[];
+  }
+
+  // Also fetch top reliable Wordscores-scaled bills (both poles) for legislative comparison
+  const scaledBills = db
+    .prepare(
+      `SELECT b.*, s.transformed_wordscore, s.raw_wordscore, s.standard_error, s.overlap_pct, s.confidence_tier
+       FROM entity_scaling_scores s
+       JOIN bills b ON b.id = s.entity_id
+       WHERE s.entity_type = 'bill' AND s.confidence_tier IN ('High', 'Moderate')
+       ORDER BY ABS(s.transformed_wordscore) DESC
+       LIMIT 10`
+    )
+    .all() as Array<
+    BillDbRow & {
+      transformed_wordscore: number;
+      raw_wordscore: number;
+      standard_error: number;
+      overlap_pct: number;
+      confidence_tier: string;
+    }
+  >;
+
+  const scoredBillSamples = scaledBills.map((sb) => {
+    const cited = registerBillCitation(ctx, sb);
+    return {
+      billId: cited.id,
+      session: cited.session,
+      billNumber: cited.billNumber,
+      title: cited.title,
+      primaryAuthor: cited.primaryAuthor,
+      transformedWordscore: Number(sb.transformed_wordscore),
+      standardError: Number(sb.standard_error),
+      overlapPct: Number(sb.overlap_pct),
+      confidenceTier: sb.confidence_tier,
+    };
+  });
+
+  return {
+    payload: {
+      query: q || domain || '(party platform overview)',
+      platforms,
+      matchingPlanksCount: planks.length,
+      matchingPlanks: planks.map((p) => ({
+        party: p.party,
+        year: p.year,
+        chapter: p.chapter,
+        plankNumber: p.plank_number,
+        heading: p.heading,
+        excerpt: p.body.length > 320 ? `${p.body.slice(0, 317)}…` : p.body,
+        rileCode: p.rile_code,
+        rileLabel: p.rile_label,
+        rileDirection: p.rile_direction,
+        texasDomain: p.texas_domain,
+      })),
+      scoredBillSamples,
+    },
+    summary: `${platforms.length} party platforms · ${planks.length} matching planks · ${scoredBillSamples.length} Wordscores bills`,
+    resultCount: planks.length,
+  };
+}
+
 const OPENAI_TOOLS = [
   {
     type: 'function',
@@ -2173,6 +2336,23 @@ const OPENAI_TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'search_party_platforms',
+      description:
+        'Search indexed 2026 Texas Democratic and Republican party platform planks, MARPOR RILE ideological scores, Texas policy domain salience, and Wordscores vocabulary alignment of Texas bills.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Policy topic or keyword to search across Democratic and Republican platform planks.' },
+          party: { type: 'string', enum: ['Democratic', 'Republican', 'Other'], description: 'Optional party filter.' },
+          domain: { type: 'string', description: 'Optional Texas policy domain (e.g., "Public Education", "Energy", "Taxes", "Healthcare").' },
+          limit: { type: 'number', description: 'Max planks to return (default 10).' },
+        },
+      },
+    },
+  },
 ];
 
 function executeTool(
@@ -2208,6 +2388,9 @@ function executeTool(
       break;
     case 'search_agency_rules':
       res = toolSearchAgencyRules(args as Parameters<typeof toolSearchAgencyRules>[0], ctx);
+      break;
+    case 'search_party_platforms':
+      res = toolSearchPartyPlatforms(args as Parameters<typeof toolSearchPartyPlatforms>[0], ctx);
       break;
     default:
       res = {
@@ -2353,6 +2536,10 @@ function runDeterministicPlan(
     /\b(most\s+expensive|highest\s+cost|costliest|largest\s+(?:fiscal|budget)|fiscal\s+(?:note|impact|cost)|cost\s+of\s+(?:bill|bills)|budget\s+impact|how\s+much\s+does|how\s+much\s+did)\b/i.test(
       lower
     );
+  const isPlatformQuery =
+    /\b(platform|platforms|plank|planks|wordscores?|wordfish|\brile\b|manifesto|democratic\s+party|republican\s+party|gop\s+platform|party\s+alignment)\b/i.test(
+      lower
+    );
   const specificBillMatch = question.match(/\b(HB|SB|HJR|SJR|HCR|SCR)\s*(\d+)\b/i);
 
   const lines: string[] = [];
@@ -2401,6 +2588,34 @@ function runDeterministicPlan(
       lines.push(
         `- **${r.tacCitation}** (${r.actionType}, ${r.issueDate}) — **${r.agencyName}**: ${r.title}${r.fiscalImpactFormatted && r.fiscalImpactFormatted !== '—' ? ` · Rule Fiscal Est.: **${r.fiscalImpactFormatted}**` : ''}${linked ? ` · Linked Bills: ${linked}` : ''}`
       );
+    }
+  }
+
+  if (isPlatformQuery) {
+    const platRes = executeTool(
+      'search_party_platforms',
+      {
+        ...(topic ? { query: topic } : {}),
+        limit: 10,
+      },
+      ctx
+    );
+    evidence.partyPlatforms = platRes;
+    const plats = (platRes.platforms as Array<Record<string, unknown>>) || [];
+    const planks = (platRes.matchingPlanks as Array<Record<string, unknown>>) || [];
+    lines.push(`### Texas Party Platforms & Political Text Scaling`);
+    for (const p of plats) {
+      lines.push(
+        `- **${p.title}** (${p.party} ${p.year}) — **${p.plankCount}** planks · **${Number(p.wordCount).toLocaleString()}** words · MARPOR RILE **${p.rileScore}** (Logit **${p.rileLogit}**, ${p.rileRightCount} Right / ${p.rileLeftCount} Left coded planks)`
+      );
+    }
+    if (planks.length > 0) {
+      lines.push(`\n**Matching Platform Planks (${planks.length}):**`);
+      for (const pl of planks.slice(0, 8)) {
+        lines.push(
+          `- **${pl.party} ${pl.year} · ${pl.plankNumber} (${pl.heading})** [${pl.texasDomain}${pl.rileCode ? `, MARPOR ${pl.rileCode}` : ''}]: ${pl.excerpt}`
+        );
+      }
     }
   }
 
@@ -2491,7 +2706,7 @@ function runDeterministicPlan(
   }
 
   if (
-    (!isInfluencePersonQuery && !isCommitteeStatsQuery && !isAgencyRuleQuery) ||
+    (!isInfluencePersonQuery && !isCommitteeStatsQuery && !isAgencyRuleQuery && !isPlatformQuery) ||
     isBipartisanQuery ||
     isHighInfluenceBillQuery ||
     isCostQuery ||

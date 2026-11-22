@@ -35,6 +35,22 @@ import {
   startTexRegSyncJob,
   upsertParsedAgencyRules,
 } from './texasRegister.ts';
+import {
+  computeRedlineWordscoresShift,
+  getEntityPlatformAlignment,
+  getPlatformsVocabOverview,
+  ingestPlatformFromPdfUrl,
+  ingestPlatformFromPlainText,
+  isPlatformSyncInProgress,
+  listPartyPlatforms,
+  mapPlankRow,
+  MARPOR_RILE_CODEBOOK,
+  recomputeAllEntityScalingScores,
+  runWordfishScaling,
+  scoreTextWithWordscores,
+  syncOfficial2026Platforms,
+  TEXAS_DOMAIN_NAMES,
+} from './partyPlatforms.ts';
 import type {
   AgencyRuleActionType,
   AgencyRuleDetail,
@@ -52,11 +68,14 @@ import type {
   NetworkEdge,
   NetworkGraph,
   NetworkNode,
+  PlatformParty,
+  PlatformsOverviewResponse,
   RuleLinkedBill,
   TimelineCohort,
   TimelineCohortBill,
   TimelineConsolidation,
   TimelineEventItem,
+  WordscoresEntityRow,
 } from '../types.ts';
 
 export const apiRouter = Router();
@@ -344,6 +363,8 @@ apiRouter.get('/overview', (req, res) => {
         c: number;
       }
     ).c,
+    platformsCount: (db.prepare(`SELECT COUNT(*) AS c FROM party_platforms`).get() as { c: number }).c,
+    planksCount: (db.prepare(`SELECT COUNT(*) AS c FROM platform_planks`).get() as { c: number }).c,
   };
 
   const sessions = db
@@ -739,6 +760,8 @@ apiRouter.get('/bills/:id', (req, res) => {
     )
     .all(row.id) as BillRelatedRule[];
 
+  const platformAlignment = getEntityPlatformAlignment('bill', row.id);
+
   res.json({
     ...bill,
     fullText: row.full_text,
@@ -755,6 +778,7 @@ apiRouter.get('/bills/:id', (req, res) => {
     publicSentiment,
     documents,
     relatedRules,
+    platformAlignment,
     aiBrief: savedBrief?.brief || '',
     aiBriefModel: savedBrief?.model || '',
     aiBriefUpdatedAt: savedBrief?.updatedAt || '',
@@ -860,6 +884,15 @@ apiRouter.get('/bills/:id/diff', (req, res) => {
   const fromVer = versions.find((v) => v.id === fromId) ?? versions[0];
   const toVer = versions.find((v) => v.id === toId) ?? versions[versions.length - 1];
   const diff = computeLineDiff(fromVer.fullText, toVer.fullText);
+  const addedLinesText = diff.lines
+    .filter((l) => l.type === 'added')
+    .map((l) => l.text)
+    .join(' ');
+  const wordscoresShift = computeRedlineWordscoresShift(
+    fromVer.fullText,
+    toVer.fullText,
+    addedLinesText
+  );
 
   res.json({
     fromVersion: {
@@ -875,6 +908,7 @@ apiRouter.get('/bills/:id/diff', (req, res) => {
       filedDate: toVer.filedDate,
     },
     ...diff,
+    wordscoresShift,
   });
 });
 
@@ -3584,3 +3618,395 @@ apiRouter.post('/fiscal/recompute', (_req, res) => {
   const updated = backfillAllBillFiscalImpacts(true);
   res.json({ ok: true, billsUpdated: updated });
 });
+
+// ============================================================================
+// PARTY PLATFORMS & POLITICAL TEXT SCALING (Wordscores, MARPOR RILE, Wordfish)
+// ============================================================================
+
+apiRouter.get('/platforms', (_req, res) => {
+  const platforms = listPartyPlatforms();
+  const { vocabStats, topDemTerms, topRepTerms } = getPlatformsVocabOverview();
+  const payload: PlatformsOverviewResponse = {
+    platforms,
+    vocabStats,
+    topDemTerms,
+    topRepTerms,
+    syncInProgress: isPlatformSyncInProgress(),
+    availableDomains: TEXAS_DOMAIN_NAMES,
+    rileCategories: MARPOR_RILE_CODEBOOK.map((c) => ({
+      code: c.code,
+      label: c.label,
+      direction: c.direction,
+    })),
+  };
+  res.json(payload);
+});
+
+apiRouter.post('/platforms/sync', async (_req, res) => {
+  try {
+    const result = await syncOfficial2026Platforms();
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(409).json({
+      error: err instanceof Error ? err.message : 'Failed to sync 2026 party platform PDFs.',
+    });
+  }
+});
+
+apiRouter.post('/platforms/import', async (req, res) => {
+  const partyRaw = String(req.body?.party ?? '').trim();
+  const yearNum = Number(req.body?.year);
+  const title = String(req.body?.title ?? '').trim().slice(0, 180);
+  const sourceUrl = String(req.body?.sourceUrl ?? '').trim();
+  const rawText = String(req.body?.rawText ?? '').trim();
+
+  const allowedParties: PlatformParty[] = ['Democratic', 'Republican', 'Other'];
+  if (!allowedParties.includes(partyRaw as PlatformParty)) {
+    return res.status(400).json({ error: 'party must be Democratic, Republican, or Other.' });
+  }
+  if (!Number.isInteger(yearNum) || yearNum < 1950 || yearNum > 2050) {
+    return res.status(400).json({ error: 'year must be a valid 4-digit year (1950–2050).' });
+  }
+  if (!title || title.length < 4) {
+    return res.status(400).json({ error: 'title is required (at least 4 characters).' });
+  }
+  if (!sourceUrl && rawText.length < 200) {
+    return res
+      .status(400)
+      .json({ error: 'Provide either an https:// PDF URL or at least 200 characters of platform text.' });
+  }
+
+  const slugParty = partyRaw.toLowerCase().slice(0, 3);
+  const id = `platform-${slugParty}-${yearNum}-${Date.now().toString(36).slice(-4)}`;
+
+  try {
+    let saved: { id: string; plankCount: number; wordCount: number; rileScore: number };
+    if (sourceUrl && !rawText) {
+      saved = await ingestPlatformFromPdfUrl({
+        id,
+        party: partyRaw as PlatformParty,
+        year: yearNum,
+        title,
+        sourceUrl,
+      });
+    } else {
+      let safeLink = '';
+      if (sourceUrl) {
+        try {
+          const u = new URL(sourceUrl);
+          if (u.protocol === 'https:' || u.protocol === 'http:') safeLink = u.toString();
+        } catch {
+          return res.status(400).json({ error: 'sourceUrl must be a valid http(s) URL.' });
+        }
+      }
+      saved = ingestPlatformFromPlainText({
+        id,
+        party: partyRaw as PlatformParty,
+        year: yearNum,
+        title,
+        sourceUrl: safeLink,
+        rawText,
+      });
+    }
+
+    const rescored = recomputeAllEntityScalingScores();
+    res.status(201).json({ ok: true, platform: saved, ...rescored });
+  } catch (err) {
+    res.status(400).json({
+      error: err instanceof Error ? err.message : 'Failed to import party platform.',
+    });
+  }
+});
+
+apiRouter.post('/platforms/recompute', (_req, res) => {
+  const result = recomputeAllEntityScalingScores();
+  res.json({ ok: true, ...result });
+});
+
+apiRouter.delete('/platforms/:id', (req, res) => {
+  const existing = db.prepare(`SELECT id FROM party_platforms WHERE id = ?`).get(req.params.id);
+  if (!existing) return res.status(404).json({ error: 'Platform not found' });
+  db.prepare(`DELETE FROM planks_fts WHERE platform_id = ?`).run(req.params.id);
+  db.prepare(`DELETE FROM platform_planks WHERE platform_id = ?`).run(req.params.id);
+  db.prepare(`DELETE FROM party_platforms WHERE id = ?`).run(req.params.id);
+  const rescored = recomputeAllEntityScalingScores();
+  res.json({ deleted: true, ...rescored });
+});
+
+apiRouter.get('/platforms/planks', (req, res) => {
+  const q = String(req.query.q ?? '').trim();
+  const party = String(req.query.party ?? '').trim();
+  const platformId = String(req.query.platformId ?? '').trim();
+  const domain = String(req.query.domain ?? '').trim();
+  const rileCode = String(req.query.rileCode ?? '').trim();
+  const rileDirection = String(req.query.rileDirection ?? '').trim();
+  const parsedLimit = Number(req.query.limit);
+  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(Math.floor(parsedLimit), 200) : 60;
+
+  const conds: string[] = [];
+  const params: Array<string | number> = [];
+
+  if (party) {
+    conds.push('p.party = ?');
+    params.push(party);
+  }
+  if (platformId) {
+    conds.push('p.platform_id = ?');
+    params.push(platformId);
+  }
+  if (domain) {
+    conds.push('p.texas_domain = ?');
+    params.push(domain);
+  }
+  if (rileCode) {
+    conds.push('p.rile_code = ?');
+    params.push(rileCode);
+  }
+  if (rileDirection) {
+    conds.push('p.rile_direction = ?');
+    params.push(rileDirection);
+  }
+
+  type RawPlank = Parameters<typeof mapPlankRow>[0];
+  let rows: RawPlank[] = [];
+  let totalMatches = 0;
+
+  if (q) {
+    const safeFts = buildSafeFtsQuery(q);
+    let usedFts = false;
+    if (safeFts) {
+      try {
+        const whereSql = conds.length ? `AND ${conds.join(' AND ')}` : '';
+        totalMatches = (
+          db
+            .prepare(
+              `SELECT COUNT(*) AS c
+               FROM planks_fts
+               JOIN platform_planks p ON p.id = planks_fts.plank_id
+               WHERE planks_fts MATCH ? ${whereSql}`
+            )
+            .get(safeFts, ...params) as { c: number }
+        ).c;
+
+        rows = db
+          .prepare(
+            `SELECT p.*
+             FROM planks_fts
+             JOIN platform_planks p ON p.id = planks_fts.plank_id
+             WHERE planks_fts MATCH ? ${whereSql}
+             ORDER BY bm25(planks_fts) ASC
+             LIMIT ?`
+          )
+          .all(safeFts, ...params, limit) as RawPlank[];
+        usedFts = true;
+      } catch {
+        usedFts = false;
+      }
+    }
+
+    if (!usedFts) {
+      const pat = `%${q}%`;
+      const likeConds = [...conds, '(p.heading LIKE ? OR p.body LIKE ? OR p.chapter LIKE ?)'];
+      const likeWhere = `WHERE ${likeConds.join(' AND ')}`;
+      totalMatches = (
+        db
+          .prepare(`SELECT COUNT(*) AS c FROM platform_planks p ${likeWhere}`)
+          .get(...params, pat, pat, pat) as { c: number }
+      ).c;
+      rows = db
+        .prepare(
+          `SELECT p.* FROM platform_planks p ${likeWhere} ORDER BY p.year DESC, p.sort_order ASC LIMIT ?`
+        )
+        .all(...params, pat, pat, pat, limit) as RawPlank[];
+    }
+  } else {
+    const whereSql = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+    totalMatches = (
+      db
+        .prepare(`SELECT COUNT(*) AS c FROM platform_planks p ${whereSql}`)
+        .get(...params) as { c: number }
+    ).c;
+    rows = db
+      .prepare(
+        `SELECT p.* FROM platform_planks p ${whereSql} ORDER BY p.year DESC, p.party ASC, p.sort_order ASC LIMIT ?`
+      )
+      .all(...params, limit) as RawPlank[];
+  }
+
+  res.json({
+    totalMatches,
+    planks: rows.map(mapPlankRow),
+  });
+});
+
+apiRouter.get('/platforms/wordscores', (req, res) => {
+  const entityType = String(req.query.entityType ?? 'bill').trim() === 'rule' ? 'rule' : 'bill';
+  const session = String(req.query.session ?? '').trim();
+  const chamber = String(req.query.chamber ?? '').trim();
+  const confidence = String(req.query.confidence ?? '').trim();
+  const q = String(req.query.q ?? '').trim();
+  const sort = String(req.query.sort ?? 'score_asc').trim();
+  const parsedLimit = Number(req.query.limit);
+  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(Math.floor(parsedLimit), 250) : 120;
+
+  let orderBy = 's.transformed_wordscore ASC';
+  if (sort === 'score_desc') orderBy = 's.transformed_wordscore DESC';
+  else if (sort === 'overlap_desc') orderBy = 's.overlap_pct DESC, s.matched_tokens DESC';
+  else if (sort === 'center') orderBy = 'ABS(s.transformed_wordscore) ASC';
+
+  const conds: string[] = ['s.entity_type = ?'];
+  const params: Array<string | number> = [entityType];
+
+  if (confidence === 'reliable') {
+    conds.push(`s.confidence_tier IN ('High', 'Moderate')`);
+  } else if (['High', 'Moderate', 'Low'].includes(confidence)) {
+    conds.push('s.confidence_tier = ?');
+    params.push(confidence);
+  }
+
+  let items: WordscoresEntityRow[] = [];
+
+  if (entityType === 'bill') {
+    if (session) {
+      conds.push('b.session = ?');
+      params.push(session);
+    }
+    if (chamber) {
+      conds.push('b.chamber = ?');
+      params.push(chamber);
+    }
+    if (q) {
+      conds.push('(b.title LIKE ? OR b.bill_number LIKE ? OR b.primary_author LIKE ?)');
+      const pat = `%${q}%`;
+      params.push(pat, pat, pat);
+    }
+
+    const rows = db
+      .prepare(
+        `SELECT s.*, b.session, b.bill_number, b.chamber, b.title, b.primary_author, b.stage
+         FROM entity_scaling_scores s
+         JOIN bills b ON b.id = s.entity_id
+         WHERE ${conds.join(' AND ')}
+         ORDER BY ${orderBy}
+         LIMIT ?`
+      )
+      .all(...params, limit) as Array<{
+      entity_id: string;
+      raw_wordscore: number;
+      transformed_wordscore: number;
+      standard_error: number;
+      matched_tokens: number;
+      total_tokens: number;
+      overlap_pct: number;
+      confidence_tier: WordscoresEntityRow['confidenceTier'];
+      top_dem_terms_json: string;
+      top_rep_terms_json: string;
+      session: string;
+      bill_number: string;
+      chamber: string;
+      title: string;
+      primary_author: string;
+      stage: string;
+    }>;
+
+    items = rows.map((r) => ({
+      entityType: 'bill',
+      entityId: r.entity_id,
+      label: `${r.session} ${r.bill_number}`,
+      sessionOrDate: r.session,
+      chamberOrAgency: r.chamber,
+      title: r.title,
+      authorOrCitation: r.primary_author,
+      stageOrAction: r.stage,
+      rawWordscore: Number(r.raw_wordscore),
+      transformedWordscore: Number(r.transformed_wordscore),
+      standardError: Number(r.standard_error),
+      matchedTokens: Number(r.matched_tokens),
+      totalTokens: Number(r.total_tokens),
+      overlapPct: Number(r.overlap_pct),
+      confidenceTier: r.confidence_tier,
+      topDemTerms: JSON.parse(r.top_dem_terms_json || '[]'),
+      topRepTerms: JSON.parse(r.top_rep_terms_json || '[]'),
+    }));
+  } else {
+    if (q) {
+      conds.push('(r.title LIKE ? OR r.agency_name LIKE ? OR r.tac_citation LIKE ?)');
+      const pat = `%${q}%`;
+      params.push(pat, pat, pat);
+    }
+    const rows = db
+      .prepare(
+        `SELECT s.*, r.issue_date, r.agency_name, r.tac_citation, r.title, r.action_type
+         FROM entity_scaling_scores s
+         JOIN agency_rules r ON r.id = s.entity_id
+         WHERE ${conds.join(' AND ')}
+         ORDER BY ${orderBy}
+         LIMIT ?`
+      )
+      .all(...params, limit) as Array<{
+      entity_id: string;
+      raw_wordscore: number;
+      transformed_wordscore: number;
+      standard_error: number;
+      matched_tokens: number;
+      total_tokens: number;
+      overlap_pct: number;
+      confidence_tier: WordscoresEntityRow['confidenceTier'];
+      top_dem_terms_json: string;
+      top_rep_terms_json: string;
+      issue_date: string;
+      agency_name: string;
+      tac_citation: string;
+      title: string;
+      action_type: string;
+    }>;
+
+    items = rows.map((r) => ({
+      entityType: 'rule',
+      entityId: r.entity_id,
+      label: r.tac_citation || r.agency_name.slice(0, 20),
+      sessionOrDate: r.issue_date,
+      chamberOrAgency: r.agency_name,
+      title: r.title,
+      authorOrCitation: r.tac_citation,
+      stageOrAction: r.action_type,
+      rawWordscore: Number(r.raw_wordscore),
+      transformedWordscore: Number(r.transformed_wordscore),
+      standardError: Number(r.standard_error),
+      matchedTokens: Number(r.matched_tokens),
+      totalTokens: Number(r.total_tokens),
+      overlapPct: Number(r.overlap_pct),
+      confidenceTier: r.confidence_tier,
+      topDemTerms: JSON.parse(r.top_dem_terms_json || '[]'),
+      topRepTerms: JSON.parse(r.top_rep_terms_json || '[]'),
+    }));
+  }
+
+  res.json({ entityType, count: items.length, items });
+});
+
+apiRouter.post('/platforms/wordscores/score-text', (req, res) => {
+  const text = String(req.body?.text ?? '').trim();
+  if (text.length < 30) {
+    return res.status(400).json({ error: 'Provide at least 30 characters of policy or statutory text to score.' });
+  }
+  if (text.length > 50000) {
+    return res.status(400).json({ error: 'Text exceeds 50,000 character sandbox limit.' });
+  }
+  const result = scoreTextWithWordscores(text);
+  if (!result) {
+    return res.status(409).json({ error: 'Wordscores reference vocabulary is not yet built. Sync the 2026 party platforms first.' });
+  }
+  res.json(result);
+});
+
+apiRouter.get('/platforms/wordfish', (req, res) => {
+  const mode =
+    String(req.query.mode ?? 'topic_corpus').trim() === 'historical_platforms'
+      ? 'historical_platforms'
+      : 'topic_corpus';
+  const domain = String(req.query.domain ?? 'All Indexed Policy Domains').trim();
+  const result = runWordfishScaling({ mode, domain });
+  res.json(result);
+});
+

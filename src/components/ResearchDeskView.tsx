@@ -53,6 +53,14 @@ const EXAMPLE_QUESTIONS: Array<{ label: string; question: string }> = [
     label: 'HB 2 Agency Rules',
     question: 'Which Texas Register agency rule changes implement HB 2?',
   },
+  {
+    label: '2026 Platforms on Education',
+    question: 'How do the 2026 Texas Democratic and Republican platforms compare on public education and vouchers?',
+  },
+  {
+    label: 'Platform RILE & Wordscores',
+    question: 'What are the MARPOR RILE scores for the 2026 Texas party platforms and which bills align most strongly via Wordscores?',
+  },
 ];
 
 function renderInlineMarkdown(text: string): React.ReactNode[] {

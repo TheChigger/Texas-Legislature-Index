@@ -220,6 +220,7 @@ export interface BillDetail extends BillSummary {
   publicSentiment: PublicSentimentSummary;
   documents?: BillDocument[];
   relatedRules?: BillRelatedRule[];
+  platformAlignment?: BillPlatformAlignment | null;
   aiBrief?: string;
   aiBriefModel?: string;
   aiBriefUpdatedAt?: string;
@@ -232,6 +233,19 @@ export interface DiffLine {
   newLine?: number;
 }
 
+export interface DiffWordscoresShift {
+  fromScore: number;
+  toScore: number;
+  delta: number;
+  fromRaw: number;
+  toRaw: number;
+  fromOverlapPct: number;
+  toOverlapPct: number;
+  confidenceTier: ScalingConfidenceTier;
+  addedTermsDem: Array<{ term: string; wordScore: number; count: number }>;
+  addedTermsRep: Array<{ term: string; wordScore: number; count: number }>;
+}
+
 export interface DiffResult {
   fromVersion: { id: string; label: string; amendmentNumber: string; filedDate: string };
   toVersion: { id: string; label: string; amendmentNumber: string; filedDate: string };
@@ -239,6 +253,7 @@ export interface DiffResult {
   removedCount: number;
   unchangedCount: number;
   lines: DiffLine[];
+  wordscoresShift?: DiffWordscoresShift | null;
 }
 
 export interface PoliticianSummary {
@@ -460,6 +475,8 @@ export interface OverviewResponse {
     linksCount: number;
     rulesCount?: number;
     fiscalNotesParsed?: number;
+    platformsCount?: number;
+    planksCount?: number;
   };
   sessions: Array<{
     code: string;
@@ -745,3 +762,194 @@ export interface TexRegSyncJob {
   startedAt: string;
   completedAt: string | null;
 }
+
+// ============================================================================
+// PARTY PLATFORMS & POLITICAL TEXT SCALING (Wordscores, MARPOR RILE, Wordfish)
+// ============================================================================
+
+export type PlatformParty = 'Democratic' | 'Republican' | 'Other';
+export type RileDirection = 'Right' | 'Left' | 'Neutral';
+export type ScalingConfidenceTier = 'High' | 'Moderate' | 'Low';
+
+export interface RileCategoryBreakdown {
+  code: string;
+  label: string;
+  direction: 'Right' | 'Left';
+  count: number;
+  sharePct: number;
+}
+
+export interface DomainSalienceItem {
+  domain: string;
+  count: number;
+  sharePct: number;
+}
+
+export interface WordscoreTermContribution {
+  term: string;
+  wordScore: number;
+  count: number;
+  contribution: number;
+}
+
+export interface MatchedPlatformPlank {
+  plankId: string;
+  platformId: string;
+  party: PlatformParty;
+  year: number;
+  chapter: string;
+  plankNumber: string;
+  heading: string;
+  excerpt: string;
+  rileCode: string;
+  texasDomain: string;
+  similarityScore: number;
+  sharedTerms: string[];
+}
+
+export interface WordscoresTextResult {
+  rawWordscore: number;
+  transformedWordscore: number;
+  standardError: number;
+  matchedTokens: number;
+  totalTokens: number;
+  overlapPct: number;
+  confidenceTier: ScalingConfidenceTier;
+  topDemTerms: WordscoreTermContribution[];
+  topRepTerms: WordscoreTermContribution[];
+}
+
+export interface BillPlatformAlignment {
+  entityType: 'bill' | 'rule';
+  entityId: string;
+  rawWordscore: number;
+  transformedWordscore: number;
+  standardError: number;
+  matchedTokens: number;
+  totalTokens: number;
+  overlapPct: number;
+  confidenceTier: ScalingConfidenceTier;
+  topDemTerms: WordscoreTermContribution[];
+  topRepTerms: WordscoreTermContribution[];
+  matchedPlanks: MatchedPlatformPlank[];
+  computedAt: string;
+}
+
+export interface PartyPlatformSummary {
+  id: string;
+  party: PlatformParty;
+  year: number;
+  title: string;
+  sourceUrl: string;
+  pageCount: number;
+  wordCount: number;
+  plankCount: number;
+  rileScore: number;
+  rileLogit: number;
+  rileRightCount: number;
+  rileLeftCount: number;
+  rileNeutralCount: number;
+  rileBreakdown: RileCategoryBreakdown[];
+  domainSalience: DomainSalienceItem[];
+  topTerms: Array<{ term: string; count: number; wordScore: number }>;
+  syncedAt: string;
+}
+
+export interface PlatformPlank {
+  id: string;
+  platformId: string;
+  party: PlatformParty;
+  year: number;
+  chapter: string;
+  plankNumber: string;
+  heading: string;
+  body: string;
+  wordCount: number;
+  rileCode: string;
+  rileLabel: string;
+  rileDirection: RileDirection;
+  texasDomain: string;
+  sortOrder: number;
+  snippet?: string;
+}
+
+export interface WordscoresEntityRow {
+  entityType: 'bill' | 'rule';
+  entityId: string;
+  label: string;
+  sessionOrDate: string;
+  chamberOrAgency: string;
+  title: string;
+  authorOrCitation: string;
+  stageOrAction: string;
+  rawWordscore: number;
+  transformedWordscore: number;
+  standardError: number;
+  matchedTokens: number;
+  totalTokens: number;
+  overlapPct: number;
+  confidenceTier: ScalingConfidenceTier;
+  topDemTerms: WordscoreTermContribution[];
+  topRepTerms: WordscoreTermContribution[];
+}
+
+export interface WordscoresVocabEntry {
+  term: string;
+  demCount: number;
+  repCount: number;
+  demRelFreq: number;
+  repRelFreq: number;
+  wordScore: number;
+  totalCount: number;
+}
+
+export interface WordfishDocumentEstimate {
+  id: string;
+  label: string;
+  kind: 'platform_dem' | 'platform_rep' | 'platform_other' | 'bill' | 'rule';
+  subtitle: string;
+  omega: number;
+  omegaSe: number;
+  alpha: number;
+  wordCount: number;
+  entityId?: string;
+}
+
+export interface WordfishWordEstimate {
+  term: string;
+  beta: number;
+  psi: number;
+  totalCount: number;
+}
+
+export interface WordfishResult {
+  mode: 'topic_corpus' | 'historical_platforms';
+  domain: string;
+  available: boolean;
+  reason?: string;
+  converged: boolean;
+  iterations: number;
+  docCount: number;
+  vocabSize: number;
+  documents: WordfishDocumentEstimate[];
+  words: WordfishWordEstimate[];
+  computedAt: string;
+}
+
+export interface PlatformsOverviewResponse {
+  platforms: PartyPlatformSummary[];
+  vocabStats: {
+    totalTerms: number;
+    scoredBillsCount: number;
+    scoredRulesCount: number;
+    highConfidenceBillsCount: number;
+    demRawMean: number;
+    repRawMean: number;
+  };
+  topDemTerms: WordscoresVocabEntry[];
+  topRepTerms: WordscoresVocabEntry[];
+  syncInProgress: boolean;
+  availableDomains: string[];
+  rileCategories: Array<{ code: string; label: string; direction: 'Right' | 'Left' }>;
+}
+

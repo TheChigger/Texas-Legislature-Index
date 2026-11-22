@@ -418,6 +418,90 @@ export function initSchema(): void {
       started_at TEXT NOT NULL,
       completed_at TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS party_platforms (
+      id TEXT PRIMARY KEY,
+      party TEXT NOT NULL,
+      year INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      source_url TEXT NOT NULL DEFAULT '',
+      page_count INTEGER NOT NULL DEFAULT 0,
+      word_count INTEGER NOT NULL DEFAULT 0,
+      plank_count INTEGER NOT NULL DEFAULT 0,
+      rile_score REAL NOT NULL DEFAULT 0,
+      rile_logit REAL NOT NULL DEFAULT 0,
+      rile_right_count INTEGER NOT NULL DEFAULT 0,
+      rile_left_count INTEGER NOT NULL DEFAULT 0,
+      rile_neutral_count INTEGER NOT NULL DEFAULT 0,
+      rile_breakdown_json TEXT NOT NULL DEFAULT '[]',
+      domain_salience_json TEXT NOT NULL DEFAULT '[]',
+      top_terms_json TEXT NOT NULL DEFAULT '[]',
+      full_text TEXT NOT NULL DEFAULT '',
+      synced_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS platform_planks (
+      id TEXT PRIMARY KEY,
+      platform_id TEXT NOT NULL REFERENCES party_platforms(id) ON DELETE CASCADE,
+      party TEXT NOT NULL,
+      year INTEGER NOT NULL,
+      chapter TEXT NOT NULL DEFAULT '',
+      plank_number TEXT NOT NULL DEFAULT '',
+      heading TEXT NOT NULL DEFAULT '',
+      body TEXT NOT NULL,
+      word_count INTEGER NOT NULL DEFAULT 0,
+      rile_code TEXT NOT NULL DEFAULT '',
+      rile_label TEXT NOT NULL DEFAULT '',
+      rile_direction TEXT NOT NULL DEFAULT 'Neutral',
+      texas_domain TEXT NOT NULL DEFAULT 'General Governance',
+      sort_order INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_planks_platform ON platform_planks(platform_id, sort_order);
+    CREATE INDEX IF NOT EXISTS idx_planks_domain ON platform_planks(texas_domain);
+    CREATE INDEX IF NOT EXISTS idx_planks_rile ON platform_planks(rile_code);
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS planks_fts USING fts5(
+      plank_id UNINDEXED,
+      platform_id UNINDEXED,
+      party,
+      chapter,
+      heading,
+      body,
+      texas_domain,
+      tokenize = 'porter unicode61'
+    );
+
+    CREATE TABLE IF NOT EXISTS wordscores_vocab (
+      term TEXT PRIMARY KEY,
+      dem_count INTEGER NOT NULL DEFAULT 0,
+      rep_count INTEGER NOT NULL DEFAULT 0,
+      dem_rel_freq REAL NOT NULL DEFAULT 0,
+      rep_rel_freq REAL NOT NULL DEFAULT 0,
+      word_score REAL NOT NULL DEFAULT 0,
+      total_count INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_wordscores_score ON wordscores_vocab(word_score);
+
+    CREATE TABLE IF NOT EXISTS entity_scaling_scores (
+      entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      raw_wordscore REAL NOT NULL DEFAULT 0,
+      transformed_wordscore REAL NOT NULL DEFAULT 0,
+      standard_error REAL NOT NULL DEFAULT 0,
+      matched_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      overlap_pct REAL NOT NULL DEFAULT 0,
+      confidence_tier TEXT NOT NULL DEFAULT 'Low',
+      top_dem_terms_json TEXT NOT NULL DEFAULT '[]',
+      top_rep_terms_json TEXT NOT NULL DEFAULT '[]',
+      matched_planks_json TEXT NOT NULL DEFAULT '[]',
+      computed_at TEXT NOT NULL,
+      PRIMARY KEY (entity_type, entity_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_entity_scaling_type ON entity_scaling_scores(entity_type, transformed_wordscore);
   `);
 
   // Safe idempotent column migrations for LBB structured fiscal impact on bills

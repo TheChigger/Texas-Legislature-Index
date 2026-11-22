@@ -45,6 +45,7 @@ interface LegislationViewProps {
   onInspectPoliticianName: (shortName: string) => void;
   onInspectInNetwork: (billId: string) => void;
   onOpenRule: (ruleId: string) => void;
+  onOpenPlatforms?: () => void;
   onOpenTloSync: () => void;
   onOpenNewBill: () => void;
   refreshSignal: number;
@@ -68,6 +69,7 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
   onInspectPoliticianName,
   onInspectInNetwork,
   onOpenRule,
+  onOpenPlatforms,
   onOpenTloSync,
   onOpenNewBill,
   refreshSignal,
@@ -1206,6 +1208,143 @@ export const LegislationView: React.FC<LegislationViewProps> = ({
                             </button>
                           ))}
                         </div>
+                      </div>
+                    )}
+
+                    {/* 2026 Party Platform Vocabulary Alignment (Wordscores) & Matched Planks */}
+                    {detail.platformAlignment && (
+                      <div className="border-t border-[#DFD9CE] pt-4 space-y-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <h3 className="text-xs font-condensed uppercase tracking-wider text-[#57534E]">
+                            2026 Party Platform Vocabulary Alignment (Wordscores)
+                          </h3>
+                          {onOpenPlatforms && (
+                            <button
+                              type="button"
+                              onClick={onOpenPlatforms}
+                              className="text-xs text-[#9A3412] hover:underline cursor-pointer whitespace-nowrap"
+                            >
+                              Open Scaling Lab
+                            </button>
+                          )}
+                        </div>
+
+                        {(() => {
+                          const pa = detail.platformAlignment!;
+                          const clamped = Math.max(-1.2, Math.min(1.2, pa.transformedWordscore));
+                          const markerPct = ((clamped + 1.25) / 2.5) * 100;
+                          const scoreColor =
+                            pa.transformedWordscore < -0.15
+                              ? 'text-[#1E3A5F]'
+                              : pa.transformedWordscore > 0.15
+                                ? 'text-[#991B1B]'
+                                : 'text-[#181715]';
+
+                          return (
+                            <div className="p-3.5 bg-[#FBF9F5] border border-[#DFD9CE] space-y-3">
+                              <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono tabular-nums">
+                                <span className={`font-semibold ${scoreColor}`}>
+                                  Wordscore {pa.transformedWordscore > 0 ? '+' : ''}
+                                  {pa.transformedWordscore.toFixed(2)}{' '}
+                                  <span className="font-normal text-[#57534E]">
+                                    (raw {pa.rawWordscore > 0 ? '+' : ''}
+                                    {pa.rawWordscore.toFixed(3)} ± {pa.standardError.toFixed(3)})
+                                  </span>
+                                </span>
+                                <span className="text-[11px] text-[#57534E]">
+                                  {pa.overlapPct}% vocab overlap ({pa.matchedTokens}/{pa.totalTokens} tokens) ·{' '}
+                                  <strong className="text-[#181715] font-medium">
+                                    {pa.confidenceTier} Confidence
+                                  </strong>
+                                </span>
+                              </div>
+
+                              {/* 1D Axis Bar */}
+                              <div className="space-y-1">
+                                <div className="flex items-center justify-between text-[10px] font-mono text-[#78716C]">
+                                  <span className="text-[#1E3A5F]">−1.0 Dem 2026 Platform</span>
+                                  <span>0.0 Balanced</span>
+                                  <span className="text-[#991B1B]">+1.0 Rep 2026 Platform</span>
+                                </div>
+                                <div className="relative h-2.5 bg-[#EAE4D9] border border-[#DFD9CE]">
+                                  <div
+                                    style={{ left: '50%' }}
+                                    className="absolute top-0 bottom-0 w-px bg-[#181715]/40"
+                                  />
+                                  <div
+                                    style={{ left: `${markerPct}%` }}
+                                    className={`absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-3 h-3 rounded-full border border-[#FFFFFF] ${
+                                      pa.transformedWordscore < -0.15
+                                        ? 'bg-[#1E3A5F]'
+                                        : pa.transformedWordscore > 0.15
+                                          ? 'bg-[#991B1B]'
+                                          : 'bg-[#181715]'
+                                    }`}
+                                  />
+                                </div>
+                              </div>
+
+                              {pa.confidenceTier === 'Low' && (
+                                <p className="text-[11px] text-[#78716C]">
+                                  Caution: Sparse policy-vocabulary overlap with the 2026 reference
+                                  platforms; treat score as exploratory.
+                                </p>
+                              )}
+
+                              {(pa.topDemTerms.length > 0 || pa.topRepTerms.length > 0) && (
+                                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] font-mono">
+                                  {pa.topDemTerms.length > 0 && (
+                                    <span className="text-[#1E3A5F]">
+                                      Dem terms: {pa.topDemTerms.slice(0, 4).map((t) => t.term).join(', ')}
+                                    </span>
+                                  )}
+                                  {pa.topRepTerms.length > 0 && (
+                                    <span className="text-[#991B1B]">
+                                      Rep terms: {pa.topRepTerms.slice(0, 4).map((t) => t.term).join(', ')}
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+
+                              {pa.matchedPlanks.length > 0 && (
+                                <div className="pt-2 border-t border-[#DFD9CE] grid grid-cols-1 md:grid-cols-2 gap-3">
+                                  {pa.matchedPlanks.map((pl) => (
+                                    <div
+                                      key={pl.plankId}
+                                      className="p-2.5 bg-[#FFFFFF] border border-[#DFD9CE] space-y-1"
+                                    >
+                                      <div className="flex items-center justify-between gap-2 text-[10px] font-mono">
+                                        <span
+                                          className={`font-semibold ${
+                                            pl.party === 'Democratic'
+                                              ? 'text-[#1E3A5F]'
+                                              : 'text-[#991B1B]'
+                                          }`}
+                                        >
+                                          {pl.party} {pl.year} · {pl.plankNumber}
+                                        </span>
+                                        <span className="text-[#78716C] tabular-nums">
+                                          sim {pl.similarityScore.toFixed(2)}
+                                        </span>
+                                      </div>
+                                      <div className="text-xs font-medium text-[#181715]">
+                                        {pl.heading}
+                                      </div>
+                                      <p className="text-[11px] text-[#57534E] leading-relaxed line-clamp-3">
+                                        {pl.excerpt}
+                                      </p>
+                                      {pl.sharedTerms.length > 0 && (
+                                        <div className="text-[10px] font-mono text-[#78716C]">
+                                          Shared: {pl.sharedTerms.join(', ')}
+                                        </div>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </div>
                     )}
 

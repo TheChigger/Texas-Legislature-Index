@@ -7,6 +7,7 @@ import { backfillBipartisanIndices, db, DB_PATH, dbExistedBeforeOpen, initSchema
 import { seedAgencyRulesIfEmpty, seedDatabaseIfEmpty, seedSupplementalFiscalNotes } from './src/server/seed.ts';
 import { backfillAllBillFiscalImpacts } from './src/server/fiscalParser.ts';
 import { relinkAllRulesToBills } from './src/server/texasRegister.ts';
+import { ensurePlatformsBootSynced } from './src/server/partyPlatforms.ts';
 import { apiRouter } from './src/server/routes.ts';
 import { cancelTloSyncJob, getLatestRunningTloSyncJob } from './src/server/tloFtp.ts';
 
@@ -27,6 +28,7 @@ async function startServer() {
   if (rulesSeeded > 0 || ruleLinks > 0) {
     console.log(`Texas Register rules ready (${rulesSeeded} seeded, ${ruleLinks} bill link(s) created)`);
   }
+  ensurePlatformsBootSynced();
 
   const app = express();
   const httpServer = http.createServer(app);

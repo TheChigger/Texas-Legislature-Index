@@ -9,6 +9,7 @@ import { AlertsView } from './components/AlertsView.tsx';
 import { ReceptivityView } from './components/ReceptivityView.tsx';
 import { StatutesView } from './components/StatutesView.tsx';
 import { AgencyRulesView } from './components/AgencyRulesView.tsx';
+import { PlatformsView } from './components/PlatformsView.tsx';
 import { ResearchDeskView } from './components/ResearchDeskView.tsx';
 import { TloSyncModal } from './components/TloSyncModal.tsx';
 import { NewBillModal } from './components/NewBillModal.tsx';
@@ -133,6 +134,9 @@ export default function App() {
       } else if (lower === 'k') {
         e.preventDefault();
         window.dispatchEvent(new CustomEvent('capitol:step-item', { detail: { delta: -1 } }));
+      } else if (lower === 'p') {
+        e.preventDefault();
+        setActiveView('platforms');
       } else if (VIEW_KEYS[e.key]) {
         e.preventDefault();
         setActiveView(VIEW_KEYS[e.key]);
@@ -243,6 +247,12 @@ export default function App() {
                   <span>{overview.totals.rulesCount} Rules</span>
                 </>
               )}
+              {typeof overview.totals.planksCount === 'number' && overview.totals.planksCount > 0 && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span>{overview.totals.planksCount} Planks</span>
+                </>
+              )}
               <span aria-hidden="true">·</span>
               <span>{overview.totals.politicians} Legislators</span>
               <span aria-hidden="true">·</span>
@@ -262,6 +272,7 @@ export default function App() {
             onInspectPoliticianName={handleOpenPoliticianByName}
             onInspectInNetwork={handleInspectInNetwork}
             onOpenRule={handleOpenRule}
+            onOpenPlatforms={() => setActiveView('platforms')}
             onOpenTloSync={() => setShowTloModal(true)}
             onOpenNewBill={() => setShowNewBillModal(true)}
             refreshSignal={refreshSignal}
@@ -346,6 +357,16 @@ export default function App() {
             selectedRuleId={selectedRuleId}
             onSelectRule={setSelectedRuleId}
             onOpenBill={handleOpenBill}
+            refreshSignal={refreshSignal}
+            onDataMutated={triggerRefresh}
+          />
+        )}
+
+        {activeView === 'platforms' && (
+          <PlatformsView
+            activeSession={activeSession}
+            onOpenBill={handleOpenBill}
+            onOpenRule={handleOpenRule}
             refreshSignal={refreshSignal}
             onDataMutated={triggerRefresh}
           />
