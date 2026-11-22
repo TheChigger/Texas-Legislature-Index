@@ -191,7 +191,48 @@ const TEXAS_LEGAL_STOPWORDS = new Set([
   'rulemaking', 'proposed', 'adopted', 'withdrawn', 'notice', 'comment', 'comments',
   'adopted', 'page', 'pages', 'contents', 'table', 'plank', 'planks', 'resolution',
   'resolutions', 'member', 'members', 'district', 'chair', 'chairman', 'secretary',
+  // Non-partisan Texas statutory / administrative boilerplate
+  'entity', 'entities', 'statewide', 'regional', 'administered', 'administer', 'administration',
+  'administrative', 'subdivision', 'council', 'director', 'reimbursement', 'procurement',
+  'report', 'reports', 'reporting', 'requirement', 'requirements', 'application', 'applications',
+  'eligible', 'eligibility', 'impact', 'impacts', 'procedure', 'procedures', 'guideline',
+  'guidelines', 'maintenance', 'planning', 'information', 'written', 'annual', 'annually',
+  'biennial', 'monthly', 'amount', 'amounts', 'designated', 'authorized', 'authorization',
+  'establishment',
 ]);
+
+// Words whose trailing 's' is part of the root form and must not be stripped
+const PROTECTED_S_TOKENS = new Set([
+  'rights', 'arms', 'goods', 'means', 'news', 'series', 'species', 'ethics', 'politics',
+  'economics', 'statistics', 'civics', 'customs', 'damages', 'headquarters', 'premises',
+  'diabetes', 'measles', 'texas', 'gas', 'bus', 'plus', 'thus', 'bias', 'lens', 'chaos',
+  'focus', 'campus', 'status', 'census', 'surplus', 'virus', 'crisis', 'basis', 'thesis',
+  'analysis', 'cannabis', 'access', 'process', 'progress', 'address', 'business', 'fairness',
+  'homelessness', 'illness', 'wellness', 'witness', 'class', 'glass', 'grass', 'mass',
+  'pass', 'loss', 'cross', 'press', 'stress', 'dress', 'less', 'unless', 'excess', 'success',
+  'congress', 'express', 'assess', 'possess', 'focus', 'bonus', 'nexus', 'versus', 'corpus',
+  'his', 'this', 'its', 'was', 'has', 'does',
+]);
+
+function normalizeScalingToken(raw: string): string {
+  if (raw.length < 4 || PROTECTED_S_TOKENS.has(raw)) return raw;
+  if (raw.endsWith('ies') && raw.length >= 5) {
+    return `${raw.slice(0, -3)}y`;
+  }
+  if (/(?:ch|sh|x|z|ss)es$/.test(raw) && raw.length >= 5) {
+    return raw.slice(0, -2);
+  }
+  if (
+    raw.endsWith('s') &&
+    !raw.endsWith('ss') &&
+    !raw.endsWith('us') &&
+    !raw.endsWith('is') &&
+    !raw.endsWith('os')
+  ) {
+    return raw.slice(0, -1);
+  }
+  return raw;
+}
 
 export function tokenizeForScaling(text: string): string[] {
   const cleaned = text
@@ -204,9 +245,11 @@ export function tokenizeForScaling(text: string): string[] {
   const rawTokens = cleaned.split(/\s+/);
   const out: string[] = [];
   for (const tok of rawTokens) {
-    const t = tok.replace(/-/g, '');
-    if (t.length < 3 || t.length > 28) continue;
-    if (STANDARD_STOPWORDS.has(t) || TEXAS_LEGAL_STOPWORDS.has(t)) continue;
+    const raw = tok.replace(/-/g, '');
+    if (raw.length < 3 || raw.length > 28) continue;
+    if (STANDARD_STOPWORDS.has(raw) || TEXAS_LEGAL_STOPWORDS.has(raw)) continue;
+    const t = normalizeScalingToken(raw);
+    if (t.length < 3 || STANDARD_STOPWORDS.has(t) || TEXAS_LEGAL_STOPWORDS.has(t)) continue;
     out.push(t);
   }
   return out;
@@ -1257,21 +1300,25 @@ export function rebuildWordscoresVocabulary(): {
 
   const totalDem = Math.max(1, demTokens.length);
   const totalRep = Math.max(1, repTokens.length);
+  const meanLen = (totalDem + totalRep) / 2;
 
-  // Filter out ultra-rare noise (< 3 total occurrences across reference texts)
+  // Minimum platform frequency >= 6 eliminates low-count flukes (e.g., 2 vs 1 occurrences).
+  // Symmetric Empirical-Bayes / Laplace smoothing (prior alpha = 3.0 on length-normalized counts)
+  // shrinks modest count differences toward 0.0 while preserving high-frequency partisan signals.
+  const PRIOR_ALPHA = 3.0;
   const vocabRows: WordscoresVocabEntry[] = [];
   for (const term of allTerms) {
     const dc = demCounts.get(term) || 0;
     const rc = repCounts.get(term) || 0;
     const total = dc + rc;
-    if (total < 3) continue;
+    if (total < 6) continue;
 
-    // Laver, Benoit & Garry (2003): F_wr = c_wr / N_r; P_wr = F_wr / (F_w,Dem + F_w,Rep)
-    // With A_Dem = -1.0, A_Rep = +1.0 -> S_w = P_w,Rep - P_w,Dem
     const fDem = dc / totalDem;
     const fRep = rc / totalRep;
-    const denom = fDem + fRep;
-    const wordScore = denom > 0 ? (fRep - fDem) / denom : 0;
+    const normDem = fDem * meanLen;
+    const normRep = fRep * meanLen;
+    const denom = normDem + normRep + 2 * PRIOR_ALPHA;
+    const wordScore = denom > 0 ? (normRep - normDem) / denom : 0;
 
     vocabRows.push({
       term,
@@ -1285,13 +1332,13 @@ export function rebuildWordscoresVocabulary(): {
   }
 
   const topDemPlatformTerms = [...vocabRows]
-    .filter((v) => v.demCount >= 5 && v.wordScore <= -0.45)
+    .filter((v) => v.demCount >= 6 && v.wordScore <= -0.35)
     .sort((a, b) => a.wordScore * Math.log(a.demCount + 1) - b.wordScore * Math.log(b.demCount + 1))
     .slice(0, 18)
     .map((v) => ({ term: v.term, count: v.demCount, wordScore: Number(v.wordScore.toFixed(3)) }));
 
   const topRepPlatformTerms = [...vocabRows]
-    .filter((v) => v.repCount >= 5 && v.wordScore >= 0.45)
+    .filter((v) => v.repCount >= 6 && v.wordScore >= 0.35)
     .sort((a, b) => b.wordScore * Math.log(b.repCount + 1) - a.wordScore * Math.log(a.repCount + 1))
     .slice(0, 18)
     .map((v) => ({ term: v.term, count: v.repCount, wordScore: Number(v.wordScore.toFixed(3)) }));
@@ -1641,10 +1688,110 @@ function buildBillCombinedText(b: BillForScoringRow): { scoringText: string; pla
   };
 }
 
+interface CorpusCalibration {
+  billMean: number;
+  billSd: number;
+  billCount: number;
+  ruleMean: number;
+  ruleSd: number;
+  ruleCount: number;
+}
+
+let cachedCorpusCalibration: CorpusCalibration | null = null;
+
+function computeCorpusCalibrationFromDb(): CorpusCalibration | null {
+  const billRows = db
+    .prepare(
+      `SELECT raw_wordscore FROM entity_scaling_scores
+       WHERE entity_type = 'bill' AND matched_tokens >= 6`
+    )
+    .all() as Array<{ raw_wordscore: number }>;
+
+  if (billRows.length < 4) return null;
+
+  const bVals = billRows.map((r) => Number(r.raw_wordscore));
+  const billMean = bVals.reduce((a, b) => a + b, 0) / bVals.length;
+  const billVar = bVals.reduce((a, b) => a + (b - billMean) ** 2, 0) / bVals.length;
+  const billSd = Math.max(0.075, Math.min(0.25, Math.sqrt(billVar)));
+
+  const ruleRows = db
+    .prepare(
+      `SELECT raw_wordscore FROM entity_scaling_scores
+       WHERE entity_type = 'rule' AND matched_tokens >= 6`
+    )
+    .all() as Array<{ raw_wordscore: number }>;
+
+  let ruleMean = billMean;
+  let ruleSd = billSd;
+  if (ruleRows.length >= 6) {
+    const rVals = ruleRows.map((r) => Number(r.raw_wordscore));
+    ruleMean = rVals.reduce((a, b) => a + b, 0) / rVals.length;
+    const ruleVar = rVals.reduce((a, b) => a + (b - ruleMean) ** 2, 0) / rVals.length;
+    ruleSd = Math.max(0.075, Math.min(0.25, Math.sqrt(ruleVar)));
+  }
+
+  cachedCorpusCalibration = {
+    billMean,
+    billSd,
+    billCount: billRows.length,
+    ruleMean,
+    ruleSd,
+    ruleCount: ruleRows.length,
+  };
+  return cachedCorpusCalibration;
+}
+
+function getCorpusCalibration(): CorpusCalibration | null {
+  if (cachedCorpusCalibration) return cachedCorpusCalibration;
+  return computeCorpusCalibrationFromDb();
+}
+
+function applyCorpusCalibration(
+  entityType: 'bill' | 'rule',
+  rawWordscore: number,
+  fallbackTransformed: number
+): number {
+  const cal = getCorpusCalibration();
+  if (!cal) return fallbackTransformed;
+  const mean = entityType === 'bill' ? cal.billMean : cal.ruleMean;
+  const sd = entityType === 'bill' ? cal.billSd : cal.ruleSd;
+  // Center bills/rules around the legislative corpus baseline (removing statutory-vs-manifesto
+  // cross-genre offset) so 0.0 represents a typical Texas bill and ±1.0 represents ±2 SD.
+  const calibrated = (rawWordscore - mean) / (2 * sd);
+  return Number(Math.max(-1.0, Math.min(1.0, calibrated)).toFixed(3));
+}
+
+function recalibrateStoredEntityScores(): void {
+  cachedCorpusCalibration = null;
+  const cal = computeCorpusCalibrationFromDb();
+  if (!cal) return;
+
+  const rows = db
+    .prepare(`SELECT entity_type, entity_id, raw_wordscore FROM entity_scaling_scores`)
+    .all() as Array<{ entity_type: 'bill' | 'rule'; entity_id: string; raw_wordscore: number }>;
+
+  const upd = db.prepare(
+    `UPDATE entity_scaling_scores SET transformed_wordscore = ? WHERE entity_type = ? AND entity_id = ?`
+  );
+
+  const tx = db.transaction(() => {
+    for (const r of rows) {
+      const mean = r.entity_type === 'bill' ? cal.billMean : cal.ruleMean;
+      const sd = r.entity_type === 'bill' ? cal.billSd : cal.ruleSd;
+      const val = Number(
+        Math.max(-1.0, Math.min(1.0, (Number(r.raw_wordscore) - mean) / (2 * sd))).toFixed(3)
+      );
+      upd.run(val, r.entity_type, r.entity_id);
+    }
+  });
+  tx();
+}
+
 function scoreAndStoreBillRows(
   billRows: BillForScoringRow[],
   plankIndex: PlankTfIdfIndex,
-  now: string
+  now: string,
+  useCorpusCalibration = true
 ): number {
   if (billRows.length === 0) return 0;
 
@@ -1663,11 +1810,14 @@ function scoreAndStoreBillRows(
       const ws = scoreTextWithWordscores(scoringText);
       if (!ws) continue;
       const matchedPlanks = findTopMatchedPlanksForText(plankText, plankIndex, 2);
+      const calibratedScore = useCorpusCalibration
+        ? applyCorpusCalibration('bill', ws.rawWordscore, ws.transformedWordscore)
+        : ws.transformedWordscore;
       upsert.run(
         'bill',
         b.id,
         ws.rawWordscore,
-        ws.transformedWordscore,
+        calibratedScore,
         ws.standardError,
         ws.matchedTokens,
         ws.totalTokens,
@@ -1715,7 +1865,11 @@ export function scoreSessionBills(
   if (billRows.length === 0) return 0;
 
   const plankIndex = buildPlankTfIdfIndex();
-  return scoreAndStoreBillRows(billRows, plankIndex, new Date().toISOString());
+  const scored = scoreAndStoreBillRows(billRows, plankIndex, new Date().toISOString(), true);
+  if (scored > 0 && !cachedCorpusCalibration) {
+    recalibrateStoredEntityScores();
+  }
+  return scored;
 }
 
 export function backfillUnscoredSessions(): number {
@@ -1742,6 +1896,9 @@ export function backfillUnscoredSessions(): number {
     const budget = i === 0 || /^9\d/.test(sess) ? 6000 : 2000;
     totalScored += scoreSessionBills(sess, { onlyMissing: true, limit: budget });
   }
+  if (totalScored > 0) {
+    recalibrateStoredEntityScores();
+  }
   return totalScored;
 }
 
@@ -1749,6 +1906,7 @@ export function recomputeAllEntityScalingScores(): {
   billsScored: number;
   rulesScored: number;
 } {
+  cachedCorpusCalibration = null;
   const vocab = rebuildWordscoresVocabulary();
   if (vocab.vocabSize === 0) {
     return { billsScored: 0, rulesScored: 0 };
@@ -1778,12 +1936,15 @@ export function recomputeAllEntityScalingScores(): {
      LIMIT ?`
   );
 
+  // Clear stale rows so corpus baseline reflects the fresh lexicon cleanly
+  db.prepare(`DELETE FROM entity_scaling_scores`).run();
+
   let billsScored = 0;
   for (let idx = 0; idx < sessions.length; idx++) {
     const sess = sessions[idx].session;
     const perSessionLimit = idx === 0 || /^9\d/.test(sess) ? 6000 : 2000;
     const billRows = selectSessionBillsStmt.all(sess, perSessionLimit) as BillForScoringRow[];
-    billsScored += scoreAndStoreBillRows(billRows, plankIndex, now);
+    billsScored += scoreAndStoreBillRows(billRows, plankIndex, now, false);
   }
 
   const ruleRows = db
@@ -1834,6 +1995,10 @@ export function recomputeAllEntityScalingScores(): {
   });
 
   txRules();
+
+  // Pass 2: Apply legislative corpus-centered calibration across all stored bills & rules
+  recalibrateStoredEntityScores();
+
   return { billsScored, rulesScored };
 }
 
@@ -1904,6 +2069,7 @@ export function getEntityPlatformAlignment(
     const { scoringText, plankText } = buildBillCombinedText(bill);
     const ws = scoreTextWithWordscores(scoringText);
     if (!ws) return null;
+    const calibrated = applyCorpusCalibration('bill', ws.rawWordscore, ws.transformedWordscore);
     const matchedPlanks = findTopMatchedPlanksForText(plankText, plankIndex, 2);
 
     db.prepare(
@@ -1916,7 +2082,7 @@ export function getEntityPlatformAlignment(
       'bill',
       bill.id,
       ws.rawWordscore,
-      ws.transformedWordscore,
+      calibrated,
       ws.standardError,
       ws.matchedTokens,
       ws.totalTokens,
@@ -1932,7 +2098,7 @@ export function getEntityPlatformAlignment(
       entityType: 'bill',
       entityId: bill.id,
       rawWordscore: ws.rawWordscore,
-      transformedWordscore: ws.transformedWordscore,
+      transformedWordscore: calibrated,
       standardError: ws.standardError,
       matchedTokens: ws.matchedTokens,
       totalTokens: ws.totalTokens,
@@ -1957,6 +2123,7 @@ export function getEntityPlatformAlignment(
   const combined = `${rule.title} ${rule.agency_name} ${rule.summary} ${rule.fiscal_note_text} ${(rule.full_text || '').slice(0, 4000)}`;
   const ws = scoreTextWithWordscores(combined);
   if (!ws) return null;
+  const calibrated = applyCorpusCalibration('rule', ws.rawWordscore, ws.transformedWordscore);
   const matchedPlanks = findTopMatchedPlanksForText(
     `${rule.title} ${rule.summary} ${(rule.full_text || '').slice(0, 1400)}`,
     plankIndex,
@@ -1973,7 +2140,7 @@ export function getEntityPlatformAlignment(
     'rule',
     rule.id,
     ws.rawWordscore,
-    ws.transformedWordscore,
+    calibrated,
     ws.standardError,
     ws.matchedTokens,
     ws.totalTokens,
@@ -1989,7 +2156,7 @@ export function getEntityPlatformAlignment(
     entityType: 'rule',
     entityId: rule.id,
     rawWordscore: ws.rawWordscore,
-    transformedWordscore: ws.transformedWordscore,
+    transformedWordscore: calibrated,
     standardError: ws.standardError,
     matchedTokens: ws.matchedTokens,
     totalTokens: ws.totalTokens,
@@ -2271,7 +2438,11 @@ function fitWordfishPoissonModel(
     }
   }
 
-  // Global polarity identification: orient Democratic platform anchor < Republican platform anchor
+  // Global polarity identification:
+  // 1) If both party platform anchors are present, orient Democratic < Republican.
+  // 2) For legislative-only (bills/rules) corpora, orient so omega correlates positively
+  //    with supervised Wordscores raw scores (preserving 100% unsupervised estimation while
+  //    fixing the arbitrary sign flip of ω vs -ω).
   const demIndices = docs
     .map((d, idx) => (d.kind === 'platform_dem' ? idx : -1))
     .filter((idx) => idx >= 0);
@@ -2285,6 +2456,23 @@ function fitWordfishPoissonModel(
     if (demMean > repMean) {
       for (let i = 0; i < D; i++) omega[i] = -omega[i];
       for (let j = 0; j < W; j++) beta[j] = -beta[j];
+    }
+  } else {
+    const pairs: Array<{ o: number; w: number }> = [];
+    for (let i = 0; i < D; i++) {
+      const ws = scoreTextWithWordscores(docs[i].text);
+      if (ws && ws.matchedTokens >= 5) {
+        pairs.push({ o: omega[i], w: ws.rawWordscore });
+      }
+    }
+    if (pairs.length >= 3) {
+      const meanO = pairs.reduce((s, p) => s + p.o, 0) / pairs.length;
+      const meanW = pairs.reduce((s, p) => s + p.w, 0) / pairs.length;
+      const cov = pairs.reduce((s, p) => s + (p.o - meanO) * (p.w - meanW), 0);
+      if (cov < 0) {
+        for (let i = 0; i < D; i++) omega[i] = -omega[i];
+        for (let j = 0; j < W; j++) beta[j] = -beta[j];
+      }
     }
   }
 
@@ -2512,7 +2700,21 @@ export function runWordfishScaling(opts: {
     });
   }
 
-  // Add Dem & Rep platform sub-chapters (split large chapters into 2-3 cohesive chunks so Wordfish has balanced document lengths)
+  // Avoid mixing statutory bills with campaign party platforms in the same unsupervised Wordfish
+  // Poisson matrix (which otherwise causes Dimension 1 to capture Statute-vs-Manifesto genre
+  // instead of policy variation).
+  // - When >= 4 matching bills/rules exist in this domain: scale legislative/regulatory texts directly
+  //   against one another (oriented left-to-right via Wordscores correlation).
+  // - Otherwise (e.g., a domain with < 4 bills): scale the Democratic vs. Republican platform chapters
+  //   for this domain against each other.
+  if (billDocs.length >= 4) {
+    const corpusLabel = sessionFilter
+      ? `${selectedDomain} — ${sessionFilter} Bills & Rules`
+      : `${selectedDomain} — Texas Bills & Rules`;
+    return fitWordfishPoissonModel(billDocs, 'topic_corpus', corpusLabel);
+  }
+
+  // Fallback when fewer than 4 bills/rules exist in this domain: scale platform sub-chapters cleanly
   for (const p of platforms) {
     const plankRows = db
       .prepare(
@@ -2550,8 +2752,7 @@ export function runWordfishScaling(opts: {
     }
   }
 
-  docs.push(...billDocs);
-  return fitWordfishPoissonModel(docs, 'topic_corpus', selectedDomain);
+  return fitWordfishPoissonModel(docs, 'topic_corpus', `${selectedDomain} — 2026 Platform Chapters`);
 }
 
 // ============================================================================
@@ -2605,16 +2806,25 @@ export function ensurePlatformsBootSynced(): void {
     db.prepare(`SELECT COUNT(*) AS c FROM party_platforms`).get() as { c: number }
   ).c;
   if (count >= 2) {
-    // Ensure entity scores exist, and backfill any session (e.g., newly synced 90R) with 0 scored bills
+    // Ensure entity scores exist, auto-upgrade pre-calibration lexicons (total_count < 6),
+    // and backfill any session (e.g., newly synced 90R) with 0 scored bills.
     const scoredCount = (
       db.prepare(`SELECT COUNT(*) AS c FROM entity_scaling_scores`).get() as { c: number }
     ).c;
-    if (scoredCount === 0) {
+    const legacyUncalibratedVocab = (
+      db.prepare(`SELECT COUNT(*) AS c FROM wordscores_vocab WHERE total_count < 6`).get() as {
+        c: number;
+      }
+    ).c;
+    if (scoredCount === 0 || legacyUncalibratedVocab > 0) {
       setImmediate(() => {
         try {
-          recomputeAllEntityScalingScores();
+          const res = recomputeAllEntityScalingScores();
+          console.log(
+            `Calibrated Wordscores lexicon & scored ${res.billsScored} bills and ${res.rulesScored} rules`
+          );
         } catch (err) {
-          console.error('Platform score backfill skipped:', err);
+          console.error('Platform score calibration skipped:', err);
         }
       });
     } else {

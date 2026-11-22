@@ -983,8 +983,9 @@ export const PlatformsView: React.FC<PlatformsViewProps> = ({
                       Wordscores Platform Vocabulary Spectrum ({wsEntityType === 'bill' ? 'Texas Bills' : 'Agency Rules'})
                     </h2>
                     <p className="text-xs text-[#57534E]">
-                      Martin–Vanberg rescaled scores anchored at 2026 Democratic Platform (−1.0) and 2026
-                      Republican Platform (+1.0), with Texas statutory boilerplate excluded.
+                      Corpus-calibrated Wordscores centered on the Texas legislative baseline (0.0 = typical bill,
+                      ±1.0 = ±2 SD) using an Empirical-Bayes smoothed, plural-normalized 2026 platform lexicon
+                      with statutory boilerplate excluded.
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2 text-xs">
@@ -1270,8 +1271,8 @@ export const PlatformsView: React.FC<PlatformsViewProps> = ({
                       Reference Vocabulary Auditor (Top Discriminating Terms)
                     </h3>
                     <p className="text-xs text-[#57534E]">
-                      Exact Laver–Benoit–Garry term weights S_w ∈ [−1, +1] computed from relative word
-                      frequencies across both 2026 platform PDFs.
+                      Empirical-Bayes smoothed Laver–Benoit–Garry term weights S_w ∈ [−1, +1] (minimum 6
+                      occurrences, singular/plural normalized) across both 2026 platform PDFs.
                     </p>
                   </div>
                   <div className="grid grid-cols-1 sm:grid-cols-2 divide-y sm:divide-y-0 sm:divide-x divide-[#DFD9CE] flex-1">
@@ -1414,7 +1415,9 @@ export const PlatformsView: React.FC<PlatformsViewProps> = ({
                     </h2>
                     <p className="text-xs text-[#57534E]">
                       Estimates latent positions ω_i and word discrimination β_j directly from word count
-                      matrices without pre-labeled scores (log λ_ij = α_i + ψ_j + β_j · ω_i).
+                      matrices without pre-labeled scores (log λ_ij = α_i + ψ_j + β_j · ω_i). Domain runs
+                      scale bills &amp; rules directly against each other to avoid manifesto-vs-statute genre
+                      splitting.
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2 text-xs">
@@ -1428,7 +1431,7 @@ export const PlatformsView: React.FC<PlatformsViewProps> = ({
                             : 'bg-[#FFFFFF] text-[#57534E] hover:text-[#181715]'
                         }`}
                       >
-                        Topic Corpus (Bills + Platforms)
+                        Topic Corpus (Same-Genre)
                       </button>
                       <button
                         type="button"
